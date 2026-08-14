@@ -30,6 +30,14 @@ services:
         sync: false
       - key: SUPABASE_BUCKET
         value: card-images
+      - key: SUPABASE_S3_ENDPOINT
+        sync: false
+      - key: SUPABASE_S3_REGION
+        sync: false
+      - key: SUPABASE_S3_ACCESS_KEY_ID
+        sync: false
+      - key: SUPABASE_S3_SECRET_ACCESS_KEY
+        sync: false
       - key: DATABASE_PATH
         value: /tmp/sportscards.db
       - key: UPLOAD_DIR

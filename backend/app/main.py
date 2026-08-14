@@ -22,7 +22,7 @@ STATIC_INDEX = Path(__file__).resolve().parent.parent / "static" / "index.html"
 
 logger = logging.getLogger("sportscard-vault")
 
-app = FastAPI(title="SportsCard Vault API", version="0.15.4", description="Detailed sports-card collection API with editable scan review, correction learning data, transparent comp-based valuation, and an offline-first test UI.")
+app = FastAPI(title="SportsCard Vault API", version="0.15.5", description="Detailed sports-card collection API with editable scan review, correction learning data, transparent comp-based valuation, and an offline-first test UI.")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=False, allow_methods=["*"], allow_headers=["*"])
 
 from contextlib import asynccontextmanager
@@ -46,7 +46,7 @@ async def lifespan(app: FastAPI):
 app.router.lifespan_context = lifespan
 
 @app.get("/health")
-def health(): return {"status":"ok","version":"0.15.4","environment":settings.app_env,"recognition":settings.recognition_provider,"pricing_provider":settings.price_provider,"database_provider":settings.database_provider}
+def health(): return {"status":"ok","version":"0.15.5","environment":settings.app_env,"recognition":settings.recognition_provider,"pricing_provider":settings.price_provider,"database_provider":settings.database_provider}
 
 
 @app.get("/", include_in_schema=False)
@@ -82,7 +82,7 @@ def system_preflight():
         "database_fallback_active": status.get("fallback_active"),
         "database_path": None if provider == "supabase" else settings.database_path,
         "database_persistent": database_persistent,
-        "image_storage_provider": "supabase" if image_persistent else "local-fallback",
+        "image_storage_provider": storage.get("provider") if image_persistent else "local-fallback",
         "image_storage_persistent": image_persistent,
         "supabase_configured": settings.supabase_ready,
         "supabase_host": settings.supabase_host,
@@ -96,7 +96,7 @@ def system_preflight():
 
 @app.get("/api/v1/system/persistence-check")
 def persistence_check():
-    """Non-destructive production-persistence diagnostics (V0.15.4)."""
+    """Non-destructive production-persistence diagnostics (V0.15.5)."""
     requested = (settings.database_provider or "sqlite").lower()
     status = db.provider_status()
     storage = storage_diagnostics()
@@ -125,6 +125,12 @@ def persistence_check():
         "supabase_dns_ok": status.get("supabase_dns_ok"),
         "supabase_dns_error": status.get("supabase_dns_error"),
         "supabase_bucket": settings.supabase_bucket if settings.supabase_ready else None,
+        "storage_dns_ok": storage.get("dns_ok"),
+        "storage_provider": storage.get("provider"),
+        "storage_configured": storage.get("configured"),
+        "storage_endpoint": storage.get("endpoint"),
+        "storage_region": storage.get("region"),
+        "storage_host": storage.get("host"),
         "storage_dns_ok": storage.get("dns_ok"),
         "storage_bucket_exists": storage.get("bucket_exists"),
         "postgres_url_configured": bool(settings.supabase_database_url),

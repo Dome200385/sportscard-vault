@@ -47,6 +47,17 @@ class Settings:
     # Supabase Supavisor Session pooler rather than the direct IPv6 endpoint.
     supabase_database_url: str | None = _clean_env("SUPABASE_DATABASE_URL")
 
+    # Supabase Storage S3 compatibility (V0.15.5). Server-side secrets only.
+    # Copy endpoint + region from Supabase Storage > S3 Configuration.
+    s3_endpoint: str | None = _clean_env("SUPABASE_S3_ENDPOINT")
+    s3_region: str | None = _clean_env("SUPABASE_S3_REGION")
+    s3_access_key_id: str | None = _clean_env("SUPABASE_S3_ACCESS_KEY_ID")
+    s3_secret_access_key: str | None = _clean_env("SUPABASE_S3_SECRET_ACCESS_KEY")
+
+    @property
+    def s3_ready(self) -> bool:
+        return bool(self.s3_endpoint and self.s3_region and self.s3_access_key_id and self.s3_secret_access_key and self.supabase_bucket)
+
     @property
     def supabase_ready(self) -> bool:
         return bool(self.supabase_url and self.supabase_secret_key)
