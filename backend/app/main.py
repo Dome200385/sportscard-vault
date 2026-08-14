@@ -22,7 +22,7 @@ STATIC_INDEX = Path(__file__).resolve().parent.parent / "static" / "index.html"
 
 logger = logging.getLogger("sportscard-vault")
 
-app = FastAPI(title="SportsCard Vault API", version="0.15.9", description="Detailed sports-card collection API with editable scan review, correction learning data, transparent comp-based valuation, and an offline-first test UI.")
+app = FastAPI(title="SportsCard Vault API", version="0.15.11", description="Detailed sports-card collection API with editable scan review, correction learning data, transparent comp-based valuation, and an offline-first test UI.")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=False, allow_methods=["*"], allow_headers=["*"])
 
 from contextlib import asynccontextmanager
@@ -46,7 +46,7 @@ async def lifespan(app: FastAPI):
 app.router.lifespan_context = lifespan
 
 @app.get("/health")
-def health(): return {"status":"ok","version":"0.15.9","environment":settings.app_env,"recognition":settings.recognition_provider,"pricing_provider":settings.price_provider,"database_provider":settings.database_provider}
+def health(): return {"status":"ok","version":"0.15.11","environment":settings.app_env,"recognition":settings.recognition_provider,"pricing_provider":settings.price_provider,"database_provider":settings.database_provider}
 
 
 @app.get("/", include_in_schema=False)
@@ -96,7 +96,7 @@ def system_preflight():
 
 @app.get("/api/v1/system/persistence-check")
 def persistence_check():
-    """Non-destructive production-persistence diagnostics (V0.15.10)."""
+    """Non-destructive production-persistence diagnostics (V0.15.11)."""
     requested = (settings.database_provider or "sqlite").lower()
     status = db.provider_status()
     storage = storage_diagnostics()
@@ -128,6 +128,9 @@ def persistence_check():
         "storage_dns_ok": storage.get("dns_ok"),
         "storage_provider": storage.get("provider"),
         "storage_sdk": storage.get("sdk"),
+        "storage_endpoint_trials": storage.get("endpoint_trials"),
+        "storage_endpoint_trial_any_usable": storage.get("endpoint_trial_any_usable"),
+        "storage_endpoint_trial_winner": storage.get("endpoint_trial_winner"),
         "storage_boto3_request_url": storage.get("boto3_request_url"),
         "storage_endpoint_path": storage.get("endpoint_path"),
         "storage_endpoint_path_ok": storage.get("endpoint_path_ok"),

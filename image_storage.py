@@ -7,7 +7,7 @@ from functools import lru_cache
 from pathlib import Path
 from urllib.parse import urlparse
 
-from config import settings
+from .config import settings
 
 
 @lru_cache(maxsize=1)
@@ -172,6 +172,72 @@ def _credential_shape() -> dict:
     }
 
 
+
+
+def _client_for_endpoint(endpoint: str):
+    """Create a diagnostic boto3 client for one explicit Supabase S3 endpoint."""
+    import boto3
+    from botocore.config import Config
+
+    return boto3.client(
+        "s3",
+        endpoint_url=endpoint,
+        region_name=settings.s3_region,
+        aws_access_key_id=settings.s3_access_key_id,
+        aws_secret_access_key=settings.s3_secret_access_key,
+        config=Config(
+            signature_version="s3v4",
+            s3={"addressing_style": "path"},
+            retries={"max_attempts": 1, "mode": "standard"},
+            connect_timeout=6,
+            read_timeout=10,
+            request_checksum_calculation="when_required",
+            response_checksum_validation="when_required",
+        ),
+    )
+
+
+def _endpoint_trial(label: str, endpoint: str) -> dict:
+    """Read-only comparison of an S3 endpoint. Never exposes credentials."""
+    parsed = urlparse(endpoint)
+    host = parsed.hostname
+    dns_ok, dns_error = _dns(host)
+    result = {
+        "label": label,
+        "endpoint": endpoint,
+        "host": host,
+        "dns_ok": dns_ok,
+        "dns_error": dns_error,
+        "head_bucket_ok": False,
+        "list_objects_ok": False,
+    }
+    if not dns_ok:
+        return result
+    try:
+        client = _client_for_endpoint(endpoint)
+        result["request_url"] = _safe_presigned_path(client)
+        try:
+            head = client.head_bucket(Bucket=settings.supabase_bucket)
+            result["head_bucket_status"] = (head.get("ResponseMetadata") or {}).get("HTTPStatusCode")
+            result["head_bucket_ok"] = result["head_bucket_status"] in {200, 204}
+        except Exception as exc:
+            result["head_bucket_exception"] = f"{type(exc).__name__}: {exc}"
+            for k, v in _client_error_details(exc).items():
+                result["head_bucket_" + k] = v
+        try:
+            listing = client.list_objects_v2(Bucket=settings.supabase_bucket, MaxKeys=1)
+            result["list_objects_status"] = (listing.get("ResponseMetadata") or {}).get("HTTPStatusCode")
+            result["list_objects_ok"] = result["list_objects_status"] in {200, 204}
+        except Exception as exc:
+            result["list_objects_exception"] = f"{type(exc).__name__}: {exc}"
+            for k, v in _client_error_details(exc).items():
+                result["list_objects_" + k] = v
+        result["usable"] = bool(result["head_bucket_ok"] or result["list_objects_ok"])
+    except Exception as exc:
+        result["client_exception"] = f"{type(exc).__name__}: {exc}"
+    return result
+
+
 def storage_diagnostics() -> dict:
     if settings.s3_ready:
         host = urlparse(settings.s3_endpoint or "").hostname
@@ -195,6 +261,21 @@ def storage_diagnostics() -> dict:
             "project_ref": settings.supabase_project_ref,
             "error": dns_error,
         }
+        # V0.15.11: compare both official Supabase S3 host forms without
+        # changing the configured production endpoint. This isolates routing
+        # from credentials and request signing.
+        ref = settings.supabase_project_ref
+        direct_endpoint = (settings.s3_endpoint or "").rstrip("/")
+        project_endpoint = f"https://{ref}.supabase.co/storage/v1/s3" if ref else None
+        trials = []
+        if direct_endpoint:
+            trials.append(_endpoint_trial("direct-storage-host", direct_endpoint))
+        if project_endpoint and project_endpoint != direct_endpoint:
+            trials.append(_endpoint_trial("project-host", project_endpoint))
+        out["endpoint_trials"] = trials
+        out["endpoint_trial_any_usable"] = any(t.get("usable") for t in trials)
+        out["endpoint_trial_winner"] = next((t.get("label") for t in trials if t.get("usable")), None)
+
         if not dns_ok:
             return out
 
