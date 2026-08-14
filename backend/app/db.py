@@ -1,9 +1,9 @@
-"""Resilient persistence facade for SportsCard Vault.
+"""Resilient persistence facade for SportsCard Vault V0.15.4.
 
-V0.15.2 deliberately keeps the API alive when Supabase is misconfigured or
-temporarily unreachable. DATABASE_PROVIDER=Supabase is still treated as the
-requested production provider, but a local SQLite fallback is activated for
-non-destructive diagnostics and scanner continuity until persistence is green.
+When DATABASE_PROVIDER=supabase, V0.15.4 prefers the native Postgres Session
+Pooler connection (SUPABASE_DATABASE_URL). This keeps collection data persistent
+even when the Supabase REST hostname is unavailable from Render. SQLite remains
+an emergency fallback only.
 """
 from __future__ import annotations
 
@@ -11,10 +11,6 @@ import socket
 from types import ModuleType
 from .config import settings
 from . import sqlite_db
-
-def _load_supabase_module():
-    from . import supabase_db
-    return supabase_db
 
 REQUESTED_PROVIDER = (settings.database_provider or "sqlite").lower()
 ACTIVE_PROVIDER = "sqlite"
@@ -38,7 +34,6 @@ def activate_sqlite_fallback(reason: str) -> None:
     ACTIVE_PROVIDER = "sqlite-fallback" if REQUESTED_PROVIDER == "supabase" else "sqlite"
     PROVIDER_ERROR = reason
     _provider = sqlite_db
-    # Ensure the fallback DB exists so scanner/history endpoints stay usable.
     try:
         sqlite_db.init_db()
     except Exception:
@@ -53,21 +48,34 @@ def init_db() -> None:
         PROVIDER_ERROR = None
         return sqlite_db.init_db()
 
+    # Preferred production path: native Postgres via Supavisor Session pooler.
+    if settings.supabase_database_url:
+        try:
+            from . import postgres_db
+            postgres_db.init_db()
+            _provider = postgres_db
+            ACTIVE_PROVIDER = "postgres"
+            PROVIDER_ERROR = None
+            return
+        except Exception as exc:
+            return activate_sqlite_fallback(f"Postgres-Verbindung fehlgeschlagen: {type(exc).__name__}: {exc}")
+
+    # Legacy REST provider remains available for environments where project DNS works.
     if not settings.supabase_ready:
-        return activate_sqlite_fallback("Supabase gewählt, aber URL oder Secret Key fehlt.")
+        return activate_sqlite_fallback("Supabase gewählt, aber weder Postgres-URL noch REST URL/Secret Key ist vollständig konfiguriert.")
 
     dns_ok, dns_error = _supabase_dns_check()
     if not dns_ok:
         return activate_sqlite_fallback(dns_error or "Supabase DNS nicht verfügbar.")
 
     try:
-        supabase_db = _load_supabase_module()
+        from . import supabase_db
         supabase_db.init_db()
         _provider = supabase_db
-        ACTIVE_PROVIDER = "supabase"
+        ACTIVE_PROVIDER = "supabase-rest"
         PROVIDER_ERROR = None
     except Exception as exc:
-        activate_sqlite_fallback(f"Supabase-Verbindung fehlgeschlagen: {type(exc).__name__}: {exc}")
+        activate_sqlite_fallback(f"Supabase-REST-Verbindung fehlgeschlagen: {type(exc).__name__}: {exc}")
 
 
 def provider_status() -> dict:
@@ -80,6 +88,7 @@ def provider_status() -> dict:
         "supabase_host": settings.supabase_host,
         "supabase_dns_ok": dns_ok,
         "supabase_dns_error": dns_error,
+        "postgres_configured": bool(settings.supabase_database_url),
     }
 
 

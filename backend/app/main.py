@@ -22,7 +22,7 @@ STATIC_INDEX = Path(__file__).resolve().parent.parent / "static" / "index.html"
 
 logger = logging.getLogger("sportscard-vault")
 
-app = FastAPI(title="SportsCard Vault API", version="0.15.3", description="Detailed sports-card collection API with editable scan review, correction learning data, transparent comp-based valuation, and an offline-first test UI.")
+app = FastAPI(title="SportsCard Vault API", version="0.15.4", description="Detailed sports-card collection API with editable scan review, correction learning data, transparent comp-based valuation, and an offline-first test UI.")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=False, allow_methods=["*"], allow_headers=["*"])
 
 from contextlib import asynccontextmanager
@@ -46,7 +46,7 @@ async def lifespan(app: FastAPI):
 app.router.lifespan_context = lifespan
 
 @app.get("/health")
-def health(): return {"status":"ok","version":"0.15.3","environment":settings.app_env,"recognition":settings.recognition_provider,"pricing_provider":settings.price_provider,"database_provider":settings.database_provider}
+def health(): return {"status":"ok","version":"0.15.4","environment":settings.app_env,"recognition":settings.recognition_provider,"pricing_provider":settings.price_provider,"database_provider":settings.database_provider}
 
 
 @app.get("/", include_in_schema=False)
@@ -62,7 +62,7 @@ def system_preflight():
     sqlite_ephemeral = provider == "sqlite" and str(settings.database_path).startswith("/tmp/")
     status = db.provider_status()
     storage = storage_diagnostics()
-    database_persistent = status.get("active_provider") == "supabase"
+    database_persistent = status.get("active_provider") in {"postgres", "supabase-rest"}
     image_persistent = bool(storage.get("bucket_exists"))
     notes = []
     if not vision_ready:
@@ -96,7 +96,7 @@ def system_preflight():
 
 @app.get("/api/v1/system/persistence-check")
 def persistence_check():
-    """Non-destructive production-persistence diagnostics (V0.15.3)."""
+    """Non-destructive production-persistence diagnostics (V0.15.4)."""
     requested = (settings.database_provider or "sqlite").lower()
     status = db.provider_status()
     storage = storage_diagnostics()
@@ -115,9 +115,9 @@ def persistence_check():
         "database_provider": requested,
         "database_active_provider": status.get("active_provider"),
         "database_fallback_active": status.get("fallback_active"),
-        "database_configured": requested == "sqlite" or settings.supabase_ready,
-        "database_persistent": status.get("active_provider") == "supabase",
-        "database_connection": status.get("active_provider") == "supabase",
+        "database_configured": requested == "sqlite" or bool(settings.supabase_database_url) or settings.supabase_ready,
+        "database_persistent": status.get("active_provider") in {"postgres", "supabase-rest"},
+        "database_connection": status.get("active_provider") in {"postgres", "supabase-rest"},
         "image_storage_persistent": bool(storage.get("bucket_exists")),
         "supabase_configured": settings.supabase_ready,
         "supabase_url_normalized": settings.supabase_url,
