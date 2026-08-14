@@ -196,7 +196,11 @@ def _json_schema() -> dict[str, Any]:
 
 
 def _prompt(locked: dict[str, Any]) -> str:
-    return f"""You identify physical sports trading cards from front/back photos.
+    """Build the recognition prompt without using an f-string around JSON examples.
+
+    This deliberately avoids Python interpreting JSON braces as format specifiers.
+    """
+    instructions = """You identify physical sports trading cards from front/back photos.
 Accuracy is more important than filling every field. Never invent a market price or monetary value.
 
 Rules:
@@ -207,14 +211,17 @@ Rules:
 5. If the card is in a visible grading slab, extract grading company, numeric/label grade and certificate number into instance_extracted. Otherwise raw_or_graded should be raw when clearly unslabbed.
 6. Do not infer a season from copyright year alone if ambiguous.
 7. Keep insert_name/subset_name/set_name/product_line separate.
-8. Candidate list should contain plausible alternate identities only when ambiguity is real, especially parallel/variation ambiguity. Each candidate must put only differing fields into field_overrides_json as a compact JSON string (for example {"parallel_name":"Silver Prizm"}).
+8. Candidate list should contain plausible alternate identities only when ambiguity is real, especially parallel/variation ambiguity. Each candidate must put only differing fields into field_overrides_json as a compact JSON string. Example: {\"parallel_name\":\"Silver Prizm\"}.
 9. Evidence should be short and concrete (e.g. 'back shows #123', 'front RC shield', 'back copyright 2024 Panini').
 10. Unknown values must be null, not placeholders.
 11. Boolean fields default false only when absence is reasonably observable; otherwise use low confidence.
+12. Never claim an exact parallel solely from a generic rainbow/foil appearance. Prefer null plus a candidate when multiple parallels look similar.
+13. Read tiny text and numbering carefully. Front and back may be rotated; reason from both images before deciding.
+14. If front and back appear to be different cards, add a warning and reduce overall confidence substantially.
 
 locked_context:
-{json.dumps(locked, ensure_ascii=False)}
 """
+    return instructions + json.dumps(locked, ensure_ascii=False, separators=(",", ":"))
 
 
 def analyze_with_openai(front_path: str, back_path: str | None, locked: dict[str, Any]) -> dict[str, Any]:

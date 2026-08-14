@@ -1,4 +1,4 @@
-from app.recognition import analyze_locked_context, _requires_confirmation, IDENTITY_FIELDS
+from app.recognition import analyze_locked_context, _requires_confirmation, IDENTITY_FIELDS, _prompt
 
 
 def test_safe_mode_keeps_locks_and_does_not_guess():
@@ -32,3 +32,10 @@ def test_parallel_needs_high_confidence():
 def test_no_market_value_field_in_recognition_schema():
     forbidden={'price','market_value','estimated_value','valuation'}
     assert not (forbidden & set(IDENTITY_FIELDS))
+
+
+def test_prompt_json_example_does_not_trigger_python_formatting():
+    prompt = _prompt({"sport": "Basketball", "product_line": "Prizm"})
+    assert 'Silver Prizm' in prompt
+    assert '"sport":"Basketball"' in prompt
+    assert 'locked_context:' in prompt
