@@ -1,0 +1,30 @@
+services:
+  - type: web
+    name: sportscard-vault-api
+    runtime: python
+    rootDir: backend
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: APP_ENV
+        value: production
+      - key: RECOGNITION_PROVIDER
+        value: openai
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: OPENAI_VISION_MODEL
+        value: gpt-5-mini
+      - key: PRICE_PROVIDER
+        value: manual
+      - key: MIN_RELIABLE_COMPS
+        value: 3
+      - key: DATABASE_PROVIDER
+        value: sqlite
+      - key: DATABASE_PATH
+        value: /tmp/sportscards.db
+      - key: UPLOAD_DIR
+        value: /tmp/sportscard_uploads
+      - key: PYTHON_VERSION
+        value: 3.13.5
