@@ -29,7 +29,16 @@ def _s3_client():
         region_name=settings.s3_region,
         aws_access_key_id=settings.s3_access_key_id,
         aws_secret_access_key=settings.s3_secret_access_key,
-        config=Config(signature_version="s3v4", s3={"addressing_style": "path"}),
+        config=Config(
+            signature_version="s3v4",
+            s3={"addressing_style": "path"},
+            # Recent AWS SDKs may add optional checksum headers by default.
+            # Supabase S3 implements the core PutObject API but not every
+            # optional AWS checksum extension, so only calculate/validate
+            # checksums when the protocol explicitly requires them.
+            request_checksum_calculation="when_required",
+            response_checksum_validation="when_required",
+        ),
     )
 
 
@@ -54,6 +63,22 @@ def _dns(host: str | None, port: int = 443) -> tuple[bool, str | None]:
         return False, f"DNS-Auflösung fehlgeschlagen: {type(exc).__name__}: {exc}"
 
 
+def _client_error_details(exc: Exception) -> dict:
+    """Return safe S3 error diagnostics without leaking credentials."""
+    try:
+        response = getattr(exc, "response", {}) or {}
+        err = response.get("Error", {}) or {}
+        meta = response.get("ResponseMetadata", {}) or {}
+        return {
+            "s3_error_code": err.get("Code"),
+            "s3_error_message": err.get("Message"),
+            "s3_http_status": meta.get("HTTPStatusCode"),
+            "s3_request_id": meta.get("RequestId"),
+        }
+    except Exception:
+        return {}
+
+
 def storage_diagnostics() -> dict:
     if settings.s3_ready:
         host = urlparse(settings.s3_endpoint or "").hostname
@@ -67,6 +92,8 @@ def storage_diagnostics() -> dict:
             "region": settings.s3_region,
             "dns_ok": dns_ok,
             "bucket_exists": False,
+            "object_access_ok": False,
+            "bucket_probe_method": None,
             "access_key_configured": bool(settings.s3_access_key_id),
             "secret_key_configured": bool(settings.s3_secret_access_key),
             "endpoint_from_env": bool(settings.s3_endpoint_env),
@@ -75,12 +102,44 @@ def storage_diagnostics() -> dict:
         }
         if not dns_ok:
             return out
+
+        client = _s3_client()
+        # Supabase documents ListObjectsV2 as a supported S3 operation. Use it
+        # as the primary readiness probe because it tests actual object access
+        # to the configured bucket, which is exactly what card image storage
+        # needs. HeadBucket is intentionally not the sole gate because some S3
+        # compatible gateways return an unhelpful 400 for HEAD while object
+        # operations work normally.
         try:
-            _s3_client().head_bucket(Bucket=settings.supabase_bucket)
+            client.list_objects_v2(Bucket=settings.supabase_bucket, MaxKeys=1)
             out["bucket_exists"] = True
+            out["object_access_ok"] = True
+            out["bucket_probe_method"] = "list_objects_v2"
             out["error"] = None
+            return out
         except Exception as exc:
-            out["error"] = f"S3-Bucket-Abfrage fehlgeschlagen: {type(exc).__name__}: {exc}"
+            out.update(_client_error_details(exc))
+            first_error = f"ListObjectsV2 fehlgeschlagen: {type(exc).__name__}: {exc}"
+
+        # Secondary diagnostic only: ListBuckets is also implemented by
+        # Supabase and can distinguish an unknown bucket from an object-access
+        # or request-signing problem. A positive ListBuckets result alone does
+        # not mark image storage persistent; object access must work.
+        try:
+            result = client.list_buckets() or {}
+            buckets = result.get("Buckets", []) if isinstance(result, dict) else []
+            names = [b.get("Name") for b in buckets if isinstance(b, dict)]
+            out["bucket_list_visible"] = settings.supabase_bucket in names
+            if out["bucket_list_visible"]:
+                out["bucket_exists"] = True
+            out["bucket_probe_method"] = "list_objects_v2+list_buckets"
+        except Exception as exc2:
+            out["bucket_list_visible"] = False
+            out["list_buckets_error"] = f"{type(exc2).__name__}: {exc2}"
+            for k, v in _client_error_details(exc2).items():
+                out.setdefault("list_buckets_" + k, v)
+
+        out["error"] = first_error
         return out
 
     # Legacy REST fallback kept for compatibility while S3 credentials are not set.
@@ -98,6 +157,7 @@ def storage_diagnostics() -> dict:
         "region": None,
         "dns_ok": False,
         "bucket_exists": False,
+        "object_access_ok": False,
         "error": None,
     }
     if not settings.supabase_ready:
@@ -117,6 +177,7 @@ def storage_diagnostics() -> dict:
             else:
                 names.append(getattr(b, "name", None) or getattr(b, "id", None))
         out["bucket_exists"] = settings.supabase_bucket in names
+        out["object_access_ok"] = out["bucket_exists"]
         if not out["bucket_exists"]:
             out["error"] = f"Storage-Bucket '{settings.supabase_bucket}' wurde nicht gefunden."
     except Exception as exc:
@@ -141,12 +202,17 @@ def persist_image(local_path: str | None, prefix: str, side: str) -> str | None:
 
     if settings.s3_ready:
         try:
-            _s3_client().upload_file(
-                str(path),
-                settings.supabase_bucket,
-                object_path,
-                ExtraArgs={"ContentType": content_type},
-            )
+            # Card scans are small images, so use one PutObject request rather
+            # than boto3's managed upload/multipart machinery. PutObject is
+            # explicitly supported by Supabase S3 and avoids optional AWS
+            # multipart/checksum extensions that are unnecessary here.
+            with path.open("rb") as fh:
+                _s3_client().put_object(
+                    Bucket=settings.supabase_bucket,
+                    Key=object_path,
+                    Body=fh,
+                    ContentType=content_type,
+                )
             return f"s3://{settings.supabase_bucket}/{object_path}"
         except Exception:
             return local_path
