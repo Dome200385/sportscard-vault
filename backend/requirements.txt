@@ -7,3 +7,5 @@ httpx>=0.27,<1
 openai>=1.40,<3
 pillow>=10.4,<13
 supabase>=2.18,<3
+
+psycopg[binary]>=3.2,<4

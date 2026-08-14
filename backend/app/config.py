@@ -43,6 +43,9 @@ class Settings:
     supabase_url: str | None = _normalize_supabase_url(_clean_env("SUPABASE_URL"))
     supabase_secret_key: str | None = _clean_env("SUPABASE_SECRET_KEY") or _clean_env("SUPABASE_SERVICE_ROLE_KEY")
     supabase_bucket: str = _clean_env("SUPABASE_BUCKET", "card-images") or "card-images"
+    # Optional native Postgres connection string. On IPv4-only hosts, use
+    # Supabase Supavisor Session pooler rather than the direct IPv6 endpoint.
+    supabase_database_url: str | None = _clean_env("SUPABASE_DATABASE_URL")
 
     @property
     def supabase_ready(self) -> bool:

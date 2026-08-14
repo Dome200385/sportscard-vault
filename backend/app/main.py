@@ -16,12 +16,13 @@ from .pricing import Comp, calculate_valuation
 from .recognition import analyze_images
 from .catalog import rank_catalog
 from .image_storage import persist_image, signed_url, storage_ready, storage_diagnostics
+from . import postgres_probe
 
 STATIC_INDEX = Path(__file__).resolve().parent.parent / "static" / "index.html"
 
 logger = logging.getLogger("sportscard-vault")
 
-app = FastAPI(title="SportsCard Vault API", version="0.15.2", description="Detailed sports-card collection API with editable scan review, correction learning data, transparent comp-based valuation, and an offline-first test UI.")
+app = FastAPI(title="SportsCard Vault API", version="0.15.3", description="Detailed sports-card collection API with editable scan review, correction learning data, transparent comp-based valuation, and an offline-first test UI.")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=False, allow_methods=["*"], allow_headers=["*"])
 
 from contextlib import asynccontextmanager
@@ -45,7 +46,7 @@ async def lifespan(app: FastAPI):
 app.router.lifespan_context = lifespan
 
 @app.get("/health")
-def health(): return {"status":"ok","version":"0.15.2","environment":settings.app_env,"recognition":settings.recognition_provider,"pricing_provider":settings.price_provider,"database_provider":settings.database_provider}
+def health(): return {"status":"ok","version":"0.15.3","environment":settings.app_env,"recognition":settings.recognition_provider,"pricing_provider":settings.price_provider,"database_provider":settings.database_provider}
 
 
 @app.get("/", include_in_schema=False)
@@ -95,7 +96,7 @@ def system_preflight():
 
 @app.get("/api/v1/system/persistence-check")
 def persistence_check():
-    """Non-destructive production-persistence diagnostics (V0.15.2)."""
+    """Non-destructive production-persistence diagnostics (V0.15.3)."""
     requested = (settings.database_provider or "sqlite").lower()
     status = db.provider_status()
     storage = storage_diagnostics()
@@ -104,6 +105,12 @@ def persistence_check():
         errors.append(status["provider_error"])
     if storage.get("error"):
         errors.append(storage["error"])
+    pg_dns_ok, pg_dns_error = postgres_probe.dns_check()
+    pg_ok, pg_error, pg_info = postgres_probe.connection_check()
+    if pg_dns_error:
+        errors.append(pg_dns_error)
+    if pg_error:
+        errors.append(pg_error)
     checks = {
         "database_provider": requested,
         "database_active_provider": status.get("active_provider"),
@@ -120,6 +127,13 @@ def persistence_check():
         "supabase_bucket": settings.supabase_bucket if settings.supabase_ready else None,
         "storage_dns_ok": storage.get("dns_ok"),
         "storage_bucket_exists": storage.get("bucket_exists"),
+        "postgres_url_configured": bool(settings.supabase_database_url),
+        "postgres_host": postgres_probe.host(),
+        "postgres_dns_ok": pg_dns_ok,
+        "postgres_dns_error": pg_dns_error,
+        "postgres_connection_ok": pg_ok,
+        "postgres_connection_error": pg_error,
+        "postgres_info": pg_info,
     }
     checks["ready_for_mass_collection"] = bool(
         checks["database_persistent"]
