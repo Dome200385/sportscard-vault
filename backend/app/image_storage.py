@@ -67,6 +67,10 @@ def storage_diagnostics() -> dict:
             "region": settings.s3_region,
             "dns_ok": dns_ok,
             "bucket_exists": False,
+            "access_key_configured": bool(settings.s3_access_key_id),
+            "secret_key_configured": bool(settings.s3_secret_access_key),
+            "endpoint_from_env": bool(settings.s3_endpoint_env),
+            "region_from_env": bool(settings.s3_region_env),
             "error": dns_error,
         }
         if not dns_ok:
@@ -83,6 +87,11 @@ def storage_diagnostics() -> dict:
     out = {
         "provider": "supabase-rest" if settings.supabase_ready else "local",
         "configured": bool(settings.supabase_ready),
+        "s3_credentials_configured": settings.s3_credentials_ready,
+        "s3_endpoint_candidate": settings.s3_endpoint,
+        "s3_region_candidate": settings.s3_region,
+        "s3_access_key_configured": bool(settings.s3_access_key_id),
+        "s3_secret_key_configured": bool(settings.s3_secret_access_key),
         "bucket": settings.supabase_bucket if settings.supabase_ready else None,
         "host": settings.supabase_host,
         "endpoint": settings.supabase_url,

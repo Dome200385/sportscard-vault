@@ -27,6 +27,40 @@ def _normalize_supabase_url(value: str | None) -> str | None:
     return f"{parsed.scheme or 'https'}://{parsed.hostname}".rstrip("/")
 
 
+def _first_env(*names: str) -> str | None:
+    for name in names:
+        value = _clean_env(name)
+        if value:
+            return value
+    return None
+
+
+def _project_ref(supabase_url: str | None) -> str | None:
+    if not supabase_url:
+        return None
+    host = urlparse(supabase_url).hostname or ""
+    suffix = ".supabase.co"
+    if host.endswith(suffix):
+        ref = host[:-len(suffix)]
+        if ref and "." not in ref:
+            return ref
+    return None
+
+
+def _region_from_database_url(database_url: str | None) -> str | None:
+    if not database_url:
+        return None
+    host = urlparse(database_url).hostname or ""
+    # Supavisor hosts are typically aws-<n>-eu-west-3.pooler.supabase.com.
+    parts = host.split(".")[0].split("-")
+    for i, part in enumerate(parts):
+        if part in {"eu", "us", "ap", "sa", "ca", "me", "af"} and i + 2 < len(parts):
+            candidate = "-".join(parts[i:i+3])
+            if parts[i+2].isdigit():
+                return candidate
+    return None
+
+
 @dataclass(frozen=True)
 class Settings:
     app_env: str = _clean_env("APP_ENV", "development") or "development"
@@ -47,16 +81,47 @@ class Settings:
     # Supabase Supavisor Session pooler rather than the direct IPv6 endpoint.
     supabase_database_url: str | None = _clean_env("SUPABASE_DATABASE_URL")
 
-    # Supabase Storage S3 compatibility (V0.15.5). Server-side secrets only.
-    # Copy endpoint + region from Supabase Storage > S3 Configuration.
-    s3_endpoint: str | None = _clean_env("SUPABASE_S3_ENDPOINT")
-    s3_region: str | None = _clean_env("SUPABASE_S3_REGION")
-    s3_access_key_id: str | None = _clean_env("SUPABASE_S3_ACCESS_KEY_ID")
-    s3_secret_access_key: str | None = _clean_env("SUPABASE_S3_SECRET_ACCESS_KEY")
+    # Supabase Storage S3 compatibility (V0.15.6). Server-side secrets only.
+    # Accept both our explicit names and common S3/AWS aliases so a dashboard
+    # naming mismatch cannot silently disable persistent image storage.
+    s3_endpoint_env: str | None = _first_env("SUPABASE_S3_ENDPOINT", "S3_ENDPOINT", "S3_ENDPOINT_URL", "S3FS_ENDPOINT_URL")
+    s3_region_env: str | None = _first_env("SUPABASE_S3_REGION", "S3_REGION", "AWS_DEFAULT_REGION", "AWS_REGION", "S3FS_REGION")
+    s3_access_key_id: str | None = _first_env("SUPABASE_S3_ACCESS_KEY_ID", "S3_ACCESS_KEY_ID", "AWS_ACCESS_KEY_ID", "S3FS_ACCESS_KEY_ID")
+    s3_secret_access_key: str | None = _first_env("SUPABASE_S3_SECRET_ACCESS_KEY", "S3_SECRET_ACCESS_KEY", "AWS_SECRET_ACCESS_KEY", "S3FS_SECRET_ACCESS_KEY")
+
+    @property
+    def supabase_project_ref(self) -> str | None:
+        return _project_ref(self.supabase_url)
+
+    @property
+    def s3_endpoint(self) -> str | None:
+        if self.s3_endpoint_env:
+            value = self.s3_endpoint_env.rstrip("/")
+            # If the dashboard value is only the project base URL, turn it into
+            # the actual S3 protocol endpoint.
+            parsed = urlparse(value if value.startswith(("http://", "https://")) else "https://" + value)
+            host = parsed.hostname or ""
+            if host.endswith(".supabase.co") and "/storage/v1/s3" not in parsed.path:
+                ref = host.split(".")[0]
+                # Prefer Supabase's direct storage hostname; it avoids the project
+                # REST hostname DNS issue observed on Render.
+                return f"https://{ref}.storage.supabase.co/storage/v1/s3"
+            return value
+        if self.supabase_project_ref:
+            return f"https://{self.supabase_project_ref}.storage.supabase.co/storage/v1/s3"
+        return None
+
+    @property
+    def s3_region(self) -> str | None:
+        return self.s3_region_env or _region_from_database_url(self.supabase_database_url)
+
+    @property
+    def s3_credentials_ready(self) -> bool:
+        return bool(self.s3_access_key_id and self.s3_secret_access_key)
 
     @property
     def s3_ready(self) -> bool:
-        return bool(self.s3_endpoint and self.s3_region and self.s3_access_key_id and self.s3_secret_access_key and self.supabase_bucket)
+        return bool(self.s3_endpoint and self.s3_region and self.s3_credentials_ready and self.supabase_bucket)
 
     @property
     def supabase_ready(self) -> bool:

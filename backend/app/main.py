@@ -22,7 +22,7 @@ STATIC_INDEX = Path(__file__).resolve().parent.parent / "static" / "index.html"
 
 logger = logging.getLogger("sportscard-vault")
 
-app = FastAPI(title="SportsCard Vault API", version="0.15.5", description="Detailed sports-card collection API with editable scan review, correction learning data, transparent comp-based valuation, and an offline-first test UI.")
+app = FastAPI(title="SportsCard Vault API", version="0.15.6", description="Detailed sports-card collection API with editable scan review, correction learning data, transparent comp-based valuation, and an offline-first test UI.")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=False, allow_methods=["*"], allow_headers=["*"])
 
 from contextlib import asynccontextmanager
@@ -46,7 +46,7 @@ async def lifespan(app: FastAPI):
 app.router.lifespan_context = lifespan
 
 @app.get("/health")
-def health(): return {"status":"ok","version":"0.15.5","environment":settings.app_env,"recognition":settings.recognition_provider,"pricing_provider":settings.price_provider,"database_provider":settings.database_provider}
+def health(): return {"status":"ok","version":"0.15.6","environment":settings.app_env,"recognition":settings.recognition_provider,"pricing_provider":settings.price_provider,"database_provider":settings.database_provider}
 
 
 @app.get("/", include_in_schema=False)
@@ -96,7 +96,7 @@ def system_preflight():
 
 @app.get("/api/v1/system/persistence-check")
 def persistence_check():
-    """Non-destructive production-persistence diagnostics (V0.15.5)."""
+    """Non-destructive production-persistence diagnostics (V0.15.6)."""
     requested = (settings.database_provider or "sqlite").lower()
     status = db.provider_status()
     storage = storage_diagnostics()
@@ -133,6 +133,11 @@ def persistence_check():
         "storage_host": storage.get("host"),
         "storage_dns_ok": storage.get("dns_ok"),
         "storage_bucket_exists": storage.get("bucket_exists"),
+        "s3_access_key_configured": bool(settings.s3_access_key_id),
+        "s3_secret_key_configured": bool(settings.s3_secret_access_key),
+        "s3_endpoint_candidate": settings.s3_endpoint,
+        "s3_region_candidate": settings.s3_region,
+        "s3_ready": settings.s3_ready,
         "postgres_url_configured": bool(settings.supabase_database_url),
         "postgres_host": postgres_probe.host(),
         "postgres_dns_ok": pg_dns_ok,
