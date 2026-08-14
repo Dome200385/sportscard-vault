@@ -117,6 +117,10 @@ class ConfirmScanRequest(BaseModel):
     identity: CardIdentityIn
     instance: OwnedInstanceIn = Field(default_factory=OwnedInstanceIn)
 
+class AutoConfirmScanRequest(BaseModel):
+    scan_id: str
+    allow_uncertain: bool = False
+
 class ValuationOut(BaseModel):
     reliable: bool
     comp_count: int

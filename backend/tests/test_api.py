@@ -42,3 +42,27 @@ def test_exact_identity_is_reused_for_multiple_owned_copies():
         assert col['total']==1
         detail=c.get(f"/api/v1/cards/{first.json()['card_identity_id']}").json()
         assert len(detail['instances'])==2
+
+def test_auto_confirm_scan_requires_review_then_saves_without_manual_form():
+    with TestClient(app) as c:
+        scan=c.post(
+            '/api/v1/scan/analyze',
+            files={'front_image':('front.jpg',b'not-a-real-image','image/jpeg')},
+            data={'locked_context':'{"sport":"Basketball","primary_subject_name":"Auto Save Player","season":"2024-25","product_line":"Prizm"}'},
+        )
+        assert scan.status_code==200
+        sid=scan.json()['scan_id']
+        blocked=c.post('/api/v1/cards/confirm-scan-auto',json={'scan_id':sid})
+        assert blocked.status_code==409
+        saved=c.post('/api/v1/cards/confirm-scan-auto',json={'scan_id':sid,'allow_uncertain':True})
+        assert saved.status_code==200
+        body=saved.json()
+        assert body['auto_saved'] is True
+        detail=c.get('/api/v1/cards/'+body['card_identity_id']).json()
+        assert detail['identity']['primary_subject_name']=='Auto Save Player'
+        assert detail['instances'][0]['front_image_path']
+
+def test_preflight_marks_render_tmp_sqlite_as_non_persistent():
+    with TestClient(app) as c:
+        p=c.get('/api/v1/system/preflight').json()
+        assert 'database_persistent' in p

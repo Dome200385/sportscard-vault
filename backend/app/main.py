@@ -11,7 +11,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, FileResponse
 from .config import settings
 from . import db
-from .schemas import CardCreateRequest, ManualCompIn, ScanResponse, ConfirmScanRequest, ValuationOut
+from .schemas import CardCreateRequest, ManualCompIn, ScanResponse, ConfirmScanRequest, AutoConfirmScanRequest, ValuationOut, CardIdentityIn, OwnedInstanceIn
 from .pricing import Comp, calculate_valuation
 from .recognition import analyze_images
 from .catalog import rank_catalog
@@ -20,7 +20,7 @@ STATIC_INDEX = Path(__file__).resolve().parent.parent / "static" / "index.html"
 
 logger = logging.getLogger("sportscard-vault")
 
-app = FastAPI(title="SportsCard Vault API", version="0.12.0", description="Detailed sports-card collection API with editable scan review, correction learning data, transparent comp-based valuation, and an offline-first test UI.")
+app = FastAPI(title="SportsCard Vault API", version="0.13.0", description="Detailed sports-card collection API with editable scan review, correction learning data, transparent comp-based valuation, and an offline-first test UI.")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=False, allow_methods=["*"], allow_headers=["*"])
 
 from contextlib import asynccontextmanager
@@ -34,7 +34,7 @@ async def lifespan(app: FastAPI):
 app.router.lifespan_context = lifespan
 
 @app.get("/health")
-def health(): return {"status":"ok","version":"0.12.0","environment":settings.app_env,"recognition":settings.recognition_provider,"pricing_provider":settings.price_provider,"database_provider":settings.database_provider}
+def health(): return {"status":"ok","version":"0.13.0","environment":settings.app_env,"recognition":settings.recognition_provider,"pricing_provider":settings.price_provider,"database_provider":settings.database_provider}
 
 
 @app.get("/", include_in_schema=False)
@@ -46,14 +46,22 @@ def test_ui():
 @app.get("/api/v1/system/preflight")
 def system_preflight():
     vision_ready = (settings.recognition_provider or "safe").lower() == "openai" and bool(settings.openai_api_key)
+    sqlite_ephemeral = (settings.database_provider or "sqlite").lower() == "sqlite" and str(settings.database_path).startswith("/tmp/")
+    notes = []
+    if not vision_ready:
+        notes.append("Für echte automatische Kartenerkennung OPENAI_API_KEY setzen und RECOGNITION_PROVIDER=openai konfigurieren.")
+    if sqlite_ephemeral:
+        notes.append("TESTSPEICHER: SQLite liegt unter /tmp und ist auf Render nicht als dauerhafte Sammlung gedacht. Vor Massenerfassung auf Supabase/Postgres umstellen.")
     return {
         "ready_for_real_scans": vision_ready,
         "recognition_provider": settings.recognition_provider,
         "database_provider": settings.database_provider,
+        "database_path": settings.database_path,
+        "database_persistent": not sqlite_ephemeral,
         "pricing_provider": settings.price_provider,
         "vision_key_configured": bool(settings.openai_api_key),
         "vision_model": settings.openai_vision_model,
-        "notes": [] if vision_ready else ["Für echte automatische Kartenerkennung OPENAI_API_KEY setzen und RECOGNITION_PROVIDER=openai konfigurieren."],
+        "notes": notes,
     }
 
 @app.get("/api/v1/collection/summary")
@@ -137,6 +145,59 @@ def confirm_scan(payload: ConfirmScanRequest):
     created=db.create_card(identity,instance)
     corrections=db.finalize_scan(payload.scan_id,created["card_identity_id"],identity,user_instance)
     return {**created,"corrections_recorded":corrections}
+
+
+
+def _guess_value(raw):
+    if isinstance(raw, dict) and "value" in raw:
+        return raw.get("value")
+    return raw
+
+def _build_card_from_scan(scan: dict):
+    analysis = scan.get("analysis") or {}
+    extracted = analysis.get("extracted") or {}
+    instance_extracted = analysis.get("instance_extracted") or {}
+    identity_data = {}
+    for field in CardIdentityIn.model_fields:
+        value = _guess_value(extracted.get(field))
+        if value is not None:
+            identity_data[field] = value
+    # Defaults that keep the model strict without forcing manual entry.
+    identity_data.setdefault("secondary_subject_names", [])
+    for field in ("is_rookie","is_insert","is_short_print","is_super_short_print","is_case_hit","is_autograph","is_relic","is_rpa","is_booklet","is_die_cut","is_redemption","is_serial_numbered"):
+        identity_data.setdefault(field, False)
+    instance_data = {"quantity": 1, "raw_or_graded": "raw"}
+    for field in OwnedInstanceIn.model_fields:
+        value = _guess_value(instance_extracted.get(field))
+        if value is not None:
+            instance_data[field] = value
+    instance_data["front_image_path"] = scan.get("front_image_path")
+    instance_data["back_image_path"] = scan.get("back_image_path")
+    return identity_data, instance_data, analysis
+
+@app.post("/api/v1/cards/confirm-scan-auto")
+def confirm_scan_auto(payload: AutoConfirmScanRequest):
+    scan = db.get_scan(payload.scan_id)
+    if not scan:
+        raise HTTPException(404, "Scan not found")
+    if scan.get("status") == "confirmed" and scan.get("final_card_identity_id"):
+        return {"already_confirmed": True, "card_identity_id": scan["final_card_identity_id"], "scan_id": payload.scan_id}
+    identity_data, instance_data, analysis = _build_card_from_scan(scan)
+    missing = [f for f in ("sport", "primary_subject_name") if not identity_data.get(f)]
+    if missing:
+        raise HTTPException(409, detail={"message":"Automatisches Speichern nicht möglich: Pflichtangaben fehlen.","missing_fields":missing})
+    critical = {"sport","season","manufacturer","product_line","set_name","card_number_printed","primary_subject_name","parallel_name","variation_name"}
+    uncertain = [f for f in (analysis.get("requires_confirmation") or []) if f in critical]
+    if uncertain and not payload.allow_uncertain:
+        raise HTTPException(409, detail={"message":"Die Karte wurde erkannt, aber kritische Details sind noch unsicher.","requires_confirmation":uncertain,"hint":"Ergebnis prüfen und danach 'Trotzdem speichern' verwenden, falls korrekt."})
+    try:
+        identity = CardIdentityIn.model_validate(identity_data).model_dump()
+        instance = OwnedInstanceIn.model_validate(instance_data).model_dump(mode="json")
+    except Exception as exc:
+        raise HTTPException(422, detail=f"Erkannte Kartendaten konnten nicht validiert werden: {exc}")
+    created = db.create_card(identity, instance)
+    corrections = db.finalize_scan(payload.scan_id, created["card_identity_id"], identity, instance)
+    return {**created, "scan_id": payload.scan_id, "auto_saved": True, "saved_with_uncertainty": bool(uncertain), "uncertain_fields": uncertain, "corrections_recorded": corrections}
 
 @app.get("/api/v1/scans")
 def scan_history(page: int=Query(1,ge=1), page_size: int=Query(50,ge=1,le=200), status: str|None=None):
