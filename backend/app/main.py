@@ -22,7 +22,7 @@ STATIC_INDEX = Path(__file__).resolve().parent.parent / "static" / "index.html"
 
 logger = logging.getLogger("sportscard-vault")
 
-app = FastAPI(title="SportsCard Vault API", version="0.15.8", description="Detailed sports-card collection API with editable scan review, correction learning data, transparent comp-based valuation, and an offline-first test UI.")
+app = FastAPI(title="SportsCard Vault API", version="0.15.9", description="Detailed sports-card collection API with editable scan review, correction learning data, transparent comp-based valuation, and an offline-first test UI.")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=False, allow_methods=["*"], allow_headers=["*"])
 
 from contextlib import asynccontextmanager
@@ -46,7 +46,7 @@ async def lifespan(app: FastAPI):
 app.router.lifespan_context = lifespan
 
 @app.get("/health")
-def health(): return {"status":"ok","version":"0.15.8","environment":settings.app_env,"recognition":settings.recognition_provider,"pricing_provider":settings.price_provider,"database_provider":settings.database_provider}
+def health(): return {"status":"ok","version":"0.15.9","environment":settings.app_env,"recognition":settings.recognition_provider,"pricing_provider":settings.price_provider,"database_provider":settings.database_provider}
 
 
 @app.get("/", include_in_schema=False)
@@ -96,7 +96,7 @@ def system_preflight():
 
 @app.get("/api/v1/system/persistence-check")
 def persistence_check():
-    """Non-destructive production-persistence diagnostics (V0.15.8)."""
+    """Non-destructive production-persistence diagnostics (V0.15.9)."""
     requested = (settings.database_provider or "sqlite").lower()
     status = db.provider_status()
     storage = storage_diagnostics()
@@ -127,6 +127,8 @@ def persistence_check():
         "supabase_bucket": settings.supabase_bucket if settings.supabase_ready else None,
         "storage_dns_ok": storage.get("dns_ok"),
         "storage_provider": storage.get("provider"),
+        "storage_sdk": storage.get("sdk"),
+        "storage_project_ref": storage.get("project_ref"),
         "storage_configured": storage.get("configured"),
         "storage_endpoint": storage.get("endpoint"),
         "storage_region": storage.get("region"),
@@ -138,6 +140,9 @@ def persistence_check():
         "storage_s3_error_code": storage.get("s3_error_code"),
         "storage_s3_error_message": storage.get("s3_error_message"),
         "storage_s3_http_status": storage.get("s3_http_status"),
+        "storage_s3_request_id": storage.get("s3_request_id"),
+        "storage_s3_response_body": storage.get("s3_response_body"),
+        "storage_list_objects_status": storage.get("list_objects_status"),
         "storage_raw_http_status": storage.get("raw_http_status"),
         "storage_raw_response_content_type": storage.get("raw_response_content_type"),
         "storage_raw_response_body": storage.get("raw_response_body"),
