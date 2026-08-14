@@ -227,10 +227,11 @@ def analyze_with_openai(front_path: str, back_path: str | None, locked: dict[str
     client = OpenAI(api_key=settings.openai_api_key)
     content: list[dict[str, Any]] = [{"type": "input_text", "text": _prompt(locked)}]
     front_for_vision = prepare_for_vision(front_path)
-    content.append({"type": "input_image", "image_url": _data_url(front_for_vision), "detail": "high"})
+    detail = "original" if settings.openai_vision_model.startswith("gpt-5.6") else "high"
+    content.append({"type": "input_image", "image_url": _data_url(front_for_vision), "detail": detail})
     if back_path:
         back_for_vision = prepare_for_vision(back_path)
-        content.append({"type": "input_image", "image_url": _data_url(back_for_vision), "detail": "high"})
+        content.append({"type": "input_image", "image_url": _data_url(back_for_vision), "detail": detail})
 
     response = client.responses.create(
         model=settings.openai_vision_model,
@@ -263,7 +264,8 @@ def analyze_images(front_path: str, back_path: str | None, locked: dict[str, Any
             return analyze_with_openai(front_path, back_path, locked)
         except Exception as exc:
             fallback = analyze_locked_context(locked)
-            fallback["warnings"].append(f"Vision-Analyse fehlgeschlagen; Safe-Modus aktiv: {type(exc).__name__}")
+            msg = str(exc).replace(settings.openai_api_key or "", "[REDACTED]")[:500]
+            fallback["warnings"].append(f"Vision-Analyse fehlgeschlagen; Safe-Modus aktiv: {type(exc).__name__}: {msg}")
             fallback["mode"] = "safe-fallback"
             return fallback
     return analyze_locked_context(locked)

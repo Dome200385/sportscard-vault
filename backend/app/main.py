@@ -16,7 +16,7 @@ from .catalog import rank_catalog
 
 STATIC_INDEX = Path(__file__).resolve().parent.parent / "static" / "index.html"
 
-app = FastAPI(title="SportsCard Vault API", version="0.8.0", description="Detailed sports-card collection API with editable scan review, correction learning data, transparent comp-based valuation, and an offline-first test UI.")
+app = FastAPI(title="SportsCard Vault API", version="0.10.0", description="Detailed sports-card collection API with editable scan review, correction learning data, transparent comp-based valuation, and an offline-first test UI.")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=False, allow_methods=["*"], allow_headers=["*"])
 
 from contextlib import asynccontextmanager
@@ -30,7 +30,7 @@ async def lifespan(app: FastAPI):
 app.router.lifespan_context = lifespan
 
 @app.get("/health")
-def health(): return {"status":"ok","version":"0.8.0","environment":settings.app_env,"recognition":settings.recognition_provider,"pricing_provider":settings.price_provider,"database_provider":settings.database_provider}
+def health(): return {"status":"ok","version":"0.10.0","environment":settings.app_env,"recognition":settings.recognition_provider,"pricing_provider":settings.price_provider,"database_provider":settings.database_provider}
 
 
 @app.get("/", include_in_schema=False)
@@ -48,6 +48,7 @@ def system_preflight():
         "database_provider": settings.database_provider,
         "pricing_provider": settings.price_provider,
         "vision_key_configured": bool(settings.openai_api_key),
+        "vision_model": settings.openai_vision_model,
         "notes": [] if vision_ready else ["Für echte automatische Kartenerkennung OPENAI_API_KEY setzen und RECOGNITION_PROVIDER=openai konfigurieren."],
     }
 
