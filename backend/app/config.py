@@ -12,7 +12,14 @@ class Settings:
     recognition_provider: str = os.getenv("RECOGNITION_PROVIDER", "safe")
     openai_api_key: str | None = os.getenv("OPENAI_API_KEY")
     openai_vision_model: str = os.getenv("OPENAI_VISION_MODEL", "gpt-5.6-terra")
+
+    # Persistent collection/storage (V0.15). Keep these server-side only.
     supabase_url: str | None = os.getenv("SUPABASE_URL")
-    supabase_anon_key: str | None = os.getenv("SUPABASE_ANON_KEY")
+    supabase_secret_key: str | None = os.getenv("SUPABASE_SECRET_KEY") or os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+    supabase_bucket: str = os.getenv("SUPABASE_BUCKET", "card-images")
+
+    @property
+    def supabase_ready(self) -> bool:
+        return bool(self.supabase_url and self.supabase_secret_key)
 
 settings = Settings()

@@ -15,12 +15,13 @@ from .schemas import CardCreateRequest, ManualCompIn, ScanResponse, ConfirmScanR
 from .pricing import Comp, calculate_valuation
 from .recognition import analyze_images
 from .catalog import rank_catalog
+from .image_storage import persist_image, signed_url, storage_ready
 
 STATIC_INDEX = Path(__file__).resolve().parent.parent / "static" / "index.html"
 
 logger = logging.getLogger("sportscard-vault")
 
-app = FastAPI(title="SportsCard Vault API", version="0.13.1", description="Detailed sports-card collection API with editable scan review, correction learning data, transparent comp-based valuation, and an offline-first test UI.")
+app = FastAPI(title="SportsCard Vault API", version="0.15.0", description="Detailed sports-card collection API with editable scan review, correction learning data, transparent comp-based valuation, and an offline-first test UI.")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=False, allow_methods=["*"], allow_headers=["*"])
 
 from contextlib import asynccontextmanager
@@ -34,7 +35,7 @@ async def lifespan(app: FastAPI):
 app.router.lifespan_context = lifespan
 
 @app.get("/health")
-def health(): return {"status":"ok","version":"0.13.1","environment":settings.app_env,"recognition":settings.recognition_provider,"pricing_provider":settings.price_provider,"database_provider":settings.database_provider}
+def health(): return {"status":"ok","version":"0.15.0","environment":settings.app_env,"recognition":settings.recognition_provider,"pricing_provider":settings.price_provider,"database_provider":settings.database_provider}
 
 
 @app.get("/", include_in_schema=False)
@@ -46,23 +47,80 @@ def test_ui():
 @app.get("/api/v1/system/preflight")
 def system_preflight():
     vision_ready = (settings.recognition_provider or "safe").lower() == "openai" and bool(settings.openai_api_key)
-    sqlite_ephemeral = (settings.database_provider or "sqlite").lower() == "sqlite" and str(settings.database_path).startswith("/tmp/")
+    provider = (settings.database_provider or "sqlite").lower()
+    sqlite_ephemeral = provider == "sqlite" and str(settings.database_path).startswith("/tmp/")
+    supabase_persistent = provider == "supabase" and settings.supabase_ready
+    database_persistent = supabase_persistent or (provider == "sqlite" and not sqlite_ephemeral)
     notes = []
     if not vision_ready:
         notes.append("Für echte automatische Kartenerkennung OPENAI_API_KEY setzen und RECOGNITION_PROVIDER=openai konfigurieren.")
     if sqlite_ephemeral:
-        notes.append("TESTSPEICHER: SQLite liegt unter /tmp und ist auf Render nicht als dauerhafte Sammlung gedacht. Vor Massenerfassung auf Supabase/Postgres umstellen.")
+        notes.append("TESTSPEICHER aktiv: SQLite unter /tmp. V0.14 kann auf Supabase umgeschaltet werden, bevor die Massenerfassung beginnt.")
+    if provider == "supabase" and not settings.supabase_ready:
+        notes.append("Supabase gewählt, aber SUPABASE_URL oder SUPABASE_SECRET_KEY fehlt.")
     return {
         "ready_for_real_scans": vision_ready,
+        "ready_for_mass_collection": vision_ready and database_persistent and storage_ready(),
         "recognition_provider": settings.recognition_provider,
         "database_provider": settings.database_provider,
-        "database_path": settings.database_path,
-        "database_persistent": not sqlite_ephemeral,
+        "database_path": None if provider == "supabase" else settings.database_path,
+        "database_persistent": database_persistent,
+        "image_storage_provider": "supabase" if storage_ready() else "local",
+        "image_storage_persistent": storage_ready(),
+        "supabase_configured": settings.supabase_ready,
         "pricing_provider": settings.price_provider,
         "vision_key_configured": bool(settings.openai_api_key),
         "vision_model": settings.openai_vision_model,
         "notes": notes,
     }
+
+@app.get("/api/v1/system/persistence-check")
+def persistence_check():
+    """Non-destructive readiness check for the mass-collection storage layer."""
+    provider = (settings.database_provider or "sqlite").lower()
+    sqlite_ephemeral = provider == "sqlite" and str(settings.database_path).startswith("/tmp/")
+    checks = {
+        "database_provider": provider,
+        "database_configured": provider == "sqlite" or settings.supabase_ready,
+        "database_persistent": provider == "supabase" and settings.supabase_ready or (provider == "sqlite" and not sqlite_ephemeral),
+        "image_storage_persistent": storage_ready(),
+        "supabase_configured": settings.supabase_ready,
+        "supabase_bucket": settings.supabase_bucket if settings.supabase_ready else None,
+    }
+    errors = []
+    if provider == "supabase":
+        if not settings.supabase_ready:
+            errors.append("SUPABASE_URL/SUPABASE_SECRET_KEY fehlt.")
+        else:
+            try:
+                db.init_db()
+                checks["database_connection"] = True
+            except Exception as exc:
+                checks["database_connection"] = False
+                errors.append(f"Supabase-Datenbank nicht erreichbar: {type(exc).__name__}: {str(exc)[:180]}")
+            try:
+                from .image_storage import _client
+                buckets = _client().storage.list_buckets()
+                names = []
+                for b in buckets or []:
+                    if isinstance(b, dict):
+                        names.append(b.get("name") or b.get("id"))
+                    else:
+                        names.append(getattr(b, "name", None) or getattr(b, "id", None))
+                checks["storage_bucket_exists"] = settings.supabase_bucket in names
+                if not checks["storage_bucket_exists"]:
+                    errors.append(f"Storage-Bucket '{settings.supabase_bucket}' fehlt.")
+            except Exception as exc:
+                checks["storage_bucket_exists"] = False
+                errors.append(f"Supabase Storage nicht prüfbar: {type(exc).__name__}: {str(exc)[:180]}")
+    else:
+        checks["database_connection"] = True
+        checks["storage_bucket_exists"] = False
+        if sqlite_ephemeral:
+            errors.append("SQLite liegt unter /tmp und ist auf Render nicht dauerhaft.")
+    checks["ready_for_mass_collection"] = bool(checks.get("database_persistent") and checks.get("image_storage_persistent") and checks.get("database_connection") and checks.get("storage_bucket_exists"))
+    checks["errors"] = errors
+    return checks
 
 @app.get("/api/v1/collection/summary")
 def collection_summary():
@@ -98,6 +156,9 @@ def collection(q: str | None=None, sport: str | None=None, page: int=Query(1,ge=
 def card_detail(card_id: str):
     card=db.get_card(card_id)
     if not card: raise HTTPException(404,"Card not found")
+    for inst in card.get("instances", []):
+        inst["front_image_url"] = signed_url(inst.get("front_image_path"))
+        inst["back_image_url"] = signed_url(inst.get("back_image_path"))
     return card
 
 @app.post("/api/v1/scan/analyze", response_model=ScanResponse)
@@ -128,7 +189,17 @@ async def analyze_scan(front_image: UploadFile=File(...), back_image: UploadFile
     catalog_matches=rank_catalog(output.get("extracted", {}), known_rows, limit=5)
     if catalog_matches:
         output["catalog_matches"] = catalog_matches
-    sid=db.save_scan(str(front_path),str(back_path) if back_path else None,locked,output)
+    # Render's local filesystem is ephemeral. In V0.14, when Supabase is enabled,
+    # keep local copies only long enough for Vision and immediately persist both
+    # card images to the private Supabase Storage bucket.
+    image_prefix = str(uuid4())
+    try:
+        stored_front = persist_image(str(front_path), image_prefix, "front")
+        stored_back = persist_image(str(back_path), image_prefix, "back") if back_path else None
+    except Exception as exc:
+        logger.exception("persistent image upload failed")
+        raise HTTPException(502, detail=f"Persistent image upload failed: {type(exc).__name__}: {str(exc)[:300]}")
+    sid=db.save_scan(stored_front,stored_back,locked,output)
     return ScanResponse(scan_id=sid,**output)
 
 @app.post("/api/v1/cards/confirm-scan")
