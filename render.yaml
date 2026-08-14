@@ -21,7 +21,13 @@ services:
       - key: MIN_RELIABLE_COMPS
         value: 3
       - key: DATABASE_PROVIDER
-        value: sqlite
+        value: supabase
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SECRET_KEY
+        sync: false
+      - key: SUPABASE_BUCKET
+        value: card-images
       - key: DATABASE_PATH
         value: /tmp/sportscards.db
       - key: UPLOAD_DIR

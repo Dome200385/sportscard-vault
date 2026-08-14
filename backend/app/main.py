@@ -15,27 +15,37 @@ from .schemas import CardCreateRequest, ManualCompIn, ScanResponse, ConfirmScanR
 from .pricing import Comp, calculate_valuation
 from .recognition import analyze_images
 from .catalog import rank_catalog
-from .image_storage import persist_image, signed_url, storage_ready
+from .image_storage import persist_image, signed_url, storage_ready, storage_diagnostics
 
 STATIC_INDEX = Path(__file__).resolve().parent.parent / "static" / "index.html"
 
 logger = logging.getLogger("sportscard-vault")
 
-app = FastAPI(title="SportsCard Vault API", version="0.15.0", description="Detailed sports-card collection API with editable scan review, correction learning data, transparent comp-based valuation, and an offline-first test UI.")
+app = FastAPI(title="SportsCard Vault API", version="0.15.2", description="Detailed sports-card collection API with editable scan review, correction learning data, transparent comp-based valuation, and an offline-first test UI.")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=False, allow_methods=["*"], allow_headers=["*"])
 
 from contextlib import asynccontextmanager
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    db.init_db()
+    # V0.15.2: never crash the whole service just because Supabase is
+    # temporarily unreachable. The DB facade activates an explicit SQLite
+    # diagnostic fallback and exposes the root cause via persistence-check.
+    try:
+        db.init_db()
+    except Exception as exc:
+        logger.exception("database initialization failed; activating diagnostic fallback")
+        try:
+            db.activate_sqlite_fallback(f"Startup DB error: {type(exc).__name__}: {exc}")
+        except Exception:
+            logger.exception("sqlite fallback initialization also failed")
     yield
 
 # Assign lifespan after app construction for compatibility with the existing scaffold.
 app.router.lifespan_context = lifespan
 
 @app.get("/health")
-def health(): return {"status":"ok","version":"0.15.0","environment":settings.app_env,"recognition":settings.recognition_provider,"pricing_provider":settings.price_provider,"database_provider":settings.database_provider}
+def health(): return {"status":"ok","version":"0.15.2","environment":settings.app_env,"recognition":settings.recognition_provider,"pricing_provider":settings.price_provider,"database_provider":settings.database_provider}
 
 
 @app.get("/", include_in_schema=False)
@@ -49,25 +59,34 @@ def system_preflight():
     vision_ready = (settings.recognition_provider or "safe").lower() == "openai" and bool(settings.openai_api_key)
     provider = (settings.database_provider or "sqlite").lower()
     sqlite_ephemeral = provider == "sqlite" and str(settings.database_path).startswith("/tmp/")
-    supabase_persistent = provider == "supabase" and settings.supabase_ready
-    database_persistent = supabase_persistent or (provider == "sqlite" and not sqlite_ephemeral)
+    status = db.provider_status()
+    storage = storage_diagnostics()
+    database_persistent = status.get("active_provider") == "supabase"
+    image_persistent = bool(storage.get("bucket_exists"))
     notes = []
     if not vision_ready:
         notes.append("Für echte automatische Kartenerkennung OPENAI_API_KEY setzen und RECOGNITION_PROVIDER=openai konfigurieren.")
     if sqlite_ephemeral:
-        notes.append("TESTSPEICHER aktiv: SQLite unter /tmp. V0.14 kann auf Supabase umgeschaltet werden, bevor die Massenerfassung beginnt.")
-    if provider == "supabase" and not settings.supabase_ready:
-        notes.append("Supabase gewählt, aber SUPABASE_URL oder SUPABASE_SECRET_KEY fehlt.")
+        notes.append("TESTSPEICHER aktiv: SQLite unter /tmp.")
+    if status.get("fallback_active"):
+        notes.append("Supabase ist angefordert, aber derzeit nicht erreichbar; SQLite-Diagnosefallback aktiv.")
+    if status.get("provider_error"):
+        notes.append(status["provider_error"])
     return {
         "ready_for_real_scans": vision_ready,
-        "ready_for_mass_collection": vision_ready and database_persistent and storage_ready(),
+        "ready_for_mass_collection": vision_ready and database_persistent and image_persistent,
         "recognition_provider": settings.recognition_provider,
-        "database_provider": settings.database_provider,
+        "database_provider": provider,
+        "database_active_provider": status.get("active_provider"),
+        "database_fallback_active": status.get("fallback_active"),
         "database_path": None if provider == "supabase" else settings.database_path,
         "database_persistent": database_persistent,
-        "image_storage_provider": "supabase" if storage_ready() else "local",
-        "image_storage_persistent": storage_ready(),
+        "image_storage_provider": "supabase" if image_persistent else "local-fallback",
+        "image_storage_persistent": image_persistent,
         "supabase_configured": settings.supabase_ready,
+        "supabase_host": settings.supabase_host,
+        "supabase_dns_ok": status.get("supabase_dns_ok"),
+        "supabase_bucket": settings.supabase_bucket if settings.supabase_ready else None,
         "pricing_provider": settings.price_provider,
         "vision_key_configured": bool(settings.openai_api_key),
         "vision_model": settings.openai_vision_model,
@@ -76,50 +95,39 @@ def system_preflight():
 
 @app.get("/api/v1/system/persistence-check")
 def persistence_check():
-    """Non-destructive readiness check for the mass-collection storage layer."""
-    provider = (settings.database_provider or "sqlite").lower()
-    sqlite_ephemeral = provider == "sqlite" and str(settings.database_path).startswith("/tmp/")
-    checks = {
-        "database_provider": provider,
-        "database_configured": provider == "sqlite" or settings.supabase_ready,
-        "database_persistent": provider == "supabase" and settings.supabase_ready or (provider == "sqlite" and not sqlite_ephemeral),
-        "image_storage_persistent": storage_ready(),
-        "supabase_configured": settings.supabase_ready,
-        "supabase_bucket": settings.supabase_bucket if settings.supabase_ready else None,
-    }
+    """Non-destructive production-persistence diagnostics (V0.15.2)."""
+    requested = (settings.database_provider or "sqlite").lower()
+    status = db.provider_status()
+    storage = storage_diagnostics()
     errors = []
-    if provider == "supabase":
-        if not settings.supabase_ready:
-            errors.append("SUPABASE_URL/SUPABASE_SECRET_KEY fehlt.")
-        else:
-            try:
-                db.init_db()
-                checks["database_connection"] = True
-            except Exception as exc:
-                checks["database_connection"] = False
-                errors.append(f"Supabase-Datenbank nicht erreichbar: {type(exc).__name__}: {str(exc)[:180]}")
-            try:
-                from .image_storage import _client
-                buckets = _client().storage.list_buckets()
-                names = []
-                for b in buckets or []:
-                    if isinstance(b, dict):
-                        names.append(b.get("name") or b.get("id"))
-                    else:
-                        names.append(getattr(b, "name", None) or getattr(b, "id", None))
-                checks["storage_bucket_exists"] = settings.supabase_bucket in names
-                if not checks["storage_bucket_exists"]:
-                    errors.append(f"Storage-Bucket '{settings.supabase_bucket}' fehlt.")
-            except Exception as exc:
-                checks["storage_bucket_exists"] = False
-                errors.append(f"Supabase Storage nicht prüfbar: {type(exc).__name__}: {str(exc)[:180]}")
-    else:
-        checks["database_connection"] = True
-        checks["storage_bucket_exists"] = False
-        if sqlite_ephemeral:
-            errors.append("SQLite liegt unter /tmp und ist auf Render nicht dauerhaft.")
-    checks["ready_for_mass_collection"] = bool(checks.get("database_persistent") and checks.get("image_storage_persistent") and checks.get("database_connection") and checks.get("storage_bucket_exists"))
-    checks["errors"] = errors
+    if status.get("provider_error"):
+        errors.append(status["provider_error"])
+    if storage.get("error"):
+        errors.append(storage["error"])
+    checks = {
+        "database_provider": requested,
+        "database_active_provider": status.get("active_provider"),
+        "database_fallback_active": status.get("fallback_active"),
+        "database_configured": requested == "sqlite" or settings.supabase_ready,
+        "database_persistent": status.get("active_provider") == "supabase",
+        "database_connection": status.get("active_provider") == "supabase",
+        "image_storage_persistent": bool(storage.get("bucket_exists")),
+        "supabase_configured": settings.supabase_ready,
+        "supabase_url_normalized": settings.supabase_url,
+        "supabase_host": settings.supabase_host,
+        "supabase_dns_ok": status.get("supabase_dns_ok"),
+        "supabase_dns_error": status.get("supabase_dns_error"),
+        "supabase_bucket": settings.supabase_bucket if settings.supabase_ready else None,
+        "storage_dns_ok": storage.get("dns_ok"),
+        "storage_bucket_exists": storage.get("bucket_exists"),
+    }
+    checks["ready_for_mass_collection"] = bool(
+        checks["database_persistent"]
+        and checks["database_connection"]
+        and checks["image_storage_persistent"]
+        and checks["storage_bucket_exists"]
+    )
+    checks["errors"] = list(dict.fromkeys(errors))
     return checks
 
 @app.get("/api/v1/collection/summary")
