@@ -96,7 +96,7 @@ def system_preflight():
 
 @app.get("/api/v1/system/persistence-check")
 def persistence_check():
-    """Non-destructive production-persistence diagnostics (V0.15.9)."""
+    """Non-destructive production-persistence diagnostics (V0.15.10)."""
     requested = (settings.database_provider or "sqlite").lower()
     status = db.provider_status()
     storage = storage_diagnostics()
@@ -128,6 +128,19 @@ def persistence_check():
         "storage_dns_ok": storage.get("dns_ok"),
         "storage_provider": storage.get("provider"),
         "storage_sdk": storage.get("sdk"),
+        "storage_boto3_request_url": storage.get("boto3_request_url"),
+        "storage_endpoint_path": storage.get("endpoint_path"),
+        "storage_endpoint_path_ok": storage.get("endpoint_path_ok"),
+        "storage_access_key_length": storage.get("access_key_length"),
+        "storage_secret_key_length": storage.get("secret_key_length"),
+        "storage_access_key_has_outer_whitespace": storage.get("access_key_has_outer_whitespace"),
+        "storage_secret_key_has_outer_whitespace": storage.get("secret_key_has_outer_whitespace"),
+        "storage_head_bucket_ok": storage.get("head_bucket_ok"),
+        "storage_head_bucket_status": storage.get("head_bucket_status"),
+        "storage_head_bucket_exception": storage.get("head_bucket_exception"),
+        "storage_head_bucket_error_code": storage.get("head_bucket_s3_error_code"),
+        "storage_head_bucket_error_message": storage.get("head_bucket_s3_error_message"),
+        "storage_head_bucket_http_status": storage.get("head_bucket_s3_http_status"),
         "storage_project_ref": storage.get("project_ref"),
         "storage_configured": storage.get("configured"),
         "storage_endpoint": storage.get("endpoint"),

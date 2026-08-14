@@ -7,7 +7,7 @@ from functools import lru_cache
 from pathlib import Path
 from urllib.parse import urlparse
 
-from .config import settings
+from config import settings
 
 
 @lru_cache(maxsize=1)
@@ -40,10 +40,10 @@ def _s3_client():
         aws_secret_access_key=settings.s3_secret_access_key,
         config=Config(
             signature_version="s3v4",
-            s3={
-                "addressing_style": "path",
-                "payload_signing_enabled": True,
-            },
+            # Supabase requires path-style addressing. Leave payload signing at
+            # botocore's default; forcing it can make some S3-compatible
+            # gateways reject otherwise valid requests.
+            s3={"addressing_style": "path"},
             retries={"max_attempts": 2, "mode": "standard"},
             connect_timeout=10,
             read_timeout=20,
@@ -146,6 +146,32 @@ def _write_probe(client) -> dict:
                 result.setdefault("write_probe_delete_" + k, v)
 
 
+def _safe_presigned_path(client) -> str | None:
+    """Show the exact URL path boto3 builds, without credentials/signature."""
+    try:
+        url = client.generate_presigned_url(
+            "list_objects_v2",
+            Params={"Bucket": settings.supabase_bucket, "MaxKeys": 1},
+            ExpiresIn=60,
+        )
+        parsed = urlparse(url)
+        return f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
+    except Exception:
+        return None
+
+
+def _credential_shape() -> dict:
+    """Non-secret credential diagnostics; never expose the credential values."""
+    access = (settings.s3_access_key_id or "").strip()
+    secret = (settings.s3_secret_access_key or "").strip()
+    return {
+        "access_key_length": len(access),
+        "secret_key_length": len(secret),
+        "access_key_has_outer_whitespace": bool(settings.s3_access_key_id and settings.s3_access_key_id != access),
+        "secret_key_has_outer_whitespace": bool(settings.s3_secret_access_key and settings.s3_secret_access_key != secret),
+    }
+
+
 def storage_diagnostics() -> dict:
     if settings.s3_ready:
         host = urlparse(settings.s3_endpoint or "").hostname
@@ -173,6 +199,24 @@ def storage_diagnostics() -> dict:
             return out
 
         client = _s3_client()
+        out.update(_credential_shape())
+        out["boto3_request_url"] = _safe_presigned_path(client)
+        out["endpoint_path"] = urlparse(settings.s3_endpoint or "").path
+        out["endpoint_path_ok"] = out["endpoint_path"].rstrip("/") == "/storage/v1/s3"
+
+        # Probe the bucket itself first. This distinguishes bucket routing from
+        # ListObjectsV2 query handling and gives Supabase a simpler signed request.
+        try:
+            head = client.head_bucket(Bucket=settings.supabase_bucket)
+            out["head_bucket_status"] = (head.get("ResponseMetadata") or {}).get("HTTPStatusCode")
+            out["head_bucket_ok"] = out["head_bucket_status"] in {200, 204}
+            if out["head_bucket_ok"]:
+                out["bucket_exists"] = True
+        except Exception as exc:
+            out["head_bucket_ok"] = False
+            out["head_bucket_exception"] = f"{type(exc).__name__}: {exc}"
+            for k, v in _client_error_details(exc).items():
+                out["head_bucket_" + k] = v
 
         # Primary probe: official SDK + path-style addressing, matching the
         # Supabase S3 authentication documentation exactly.
