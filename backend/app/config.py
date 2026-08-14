@@ -11,7 +11,7 @@ class Settings:
     min_reliable_comps: int = int(os.getenv("MIN_RELIABLE_COMPS", "3"))
     recognition_provider: str = os.getenv("RECOGNITION_PROVIDER", "safe")
     openai_api_key: str | None = os.getenv("OPENAI_API_KEY")
-    openai_vision_model: str = os.getenv("OPENAI_VISION_MODEL", "gpt-5.6")
+    openai_vision_model: str = os.getenv("OPENAI_VISION_MODEL", "gpt-5.6-terra")
     supabase_url: str | None = os.getenv("SUPABASE_URL")
     supabase_anon_key: str | None = os.getenv("SUPABASE_ANON_KEY")
 

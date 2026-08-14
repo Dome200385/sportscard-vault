@@ -2,6 +2,8 @@ import csv
 import io
 import json
 import shutil
+import asyncio
+import logging
 from pathlib import Path
 from uuid import uuid4
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Query
@@ -16,7 +18,9 @@ from .catalog import rank_catalog
 
 STATIC_INDEX = Path(__file__).resolve().parent.parent / "static" / "index.html"
 
-app = FastAPI(title="SportsCard Vault API", version="0.11.0", description="Detailed sports-card collection API with editable scan review, correction learning data, transparent comp-based valuation, and an offline-first test UI.")
+logger = logging.getLogger("sportscard-vault")
+
+app = FastAPI(title="SportsCard Vault API", version="0.12.0", description="Detailed sports-card collection API with editable scan review, correction learning data, transparent comp-based valuation, and an offline-first test UI.")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=False, allow_methods=["*"], allow_headers=["*"])
 
 from contextlib import asynccontextmanager
@@ -30,7 +34,7 @@ async def lifespan(app: FastAPI):
 app.router.lifespan_context = lifespan
 
 @app.get("/health")
-def health(): return {"status":"ok","version":"0.11.0","environment":settings.app_env,"recognition":settings.recognition_provider,"pricing_provider":settings.price_provider,"database_provider":settings.database_provider}
+def health(): return {"status":"ok","version":"0.12.0","environment":settings.app_env,"recognition":settings.recognition_provider,"pricing_provider":settings.price_provider,"database_provider":settings.database_provider}
 
 
 @app.get("/", include_in_schema=False)
@@ -99,7 +103,17 @@ async def analyze_scan(front_image: UploadFile=File(...), back_image: UploadFile
     if back_image:
         back_path=scan_dir/("back"+Path(back_image.filename or ".jpg").suffix)
         with back_path.open("wb") as f: shutil.copyfileobj(back_image.file,f)
-    output=analyze_images(str(front_path), str(back_path) if back_path else None, locked)
+    # The OpenAI SDK call is synchronous. Running it directly inside this async
+    # endpoint blocks Uvicorn's event loop and can prevent Render health checks
+    # from answering while a vision request is in flight. On a single-worker
+    # service this may drop the browser connection as "Failed to fetch".
+    try:
+        output = await asyncio.to_thread(
+            analyze_images, str(front_path), str(back_path) if back_path else None, locked
+        )
+    except Exception as exc:
+        logger.exception("scan analysis failed")
+        raise HTTPException(502, detail=f"Vision analysis failed: {type(exc).__name__}: {str(exc)[:300]}")
     # Second-pass deterministic matching against identities already known to the collection.
     # This improves repeated-set scanning without allowing AI to fabricate an identity.
     known_rows=db.export_rows()
