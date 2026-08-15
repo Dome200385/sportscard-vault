@@ -22,7 +22,7 @@ STATIC_INDEX = Path(__file__).resolve().parent.parent / "static" / "index.html"
 
 logger = logging.getLogger("sportscard-vault")
 
-app = FastAPI(title="SportsCard Vault API", version="0.18.0", description="Detailed sports-card collection API with editable scan review, correction learning data, transparent comp-based valuation, and an offline-first test UI.")
+app = FastAPI(title="SportsCard Vault API", version="0.18.1", description="Detailed sports-card collection API with editable scan review, correction learning data, transparent comp-based valuation, and an offline-first test UI.")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=False, allow_methods=["*"], allow_headers=["*"])
 
 from contextlib import asynccontextmanager
@@ -442,22 +442,45 @@ def card_market(card_id: str):
 
 @app.get("/api/v1/collection/market-summary")
 def collection_market_summary():
-    listing=db.list_collection(page=1,page_size=200)
-    items=listing.get("items",[]) if isinstance(listing,dict) else []
-    valued=0; total=0.0; currencies=set(); missing=0
+    # Walk the complete collection instead of silently stopping at the first 200 cards.
+    # This matters for the target collection size of several thousand cards.
+    items=[]; page=1; page_size=200
+    while True:
+        listing=db.list_collection(page=page,page_size=page_size)
+        batch=listing.get("items",[]) if isinstance(listing,dict) else []
+        items.extend(batch)
+        if len(batch) < page_size:
+            break
+        page += 1
+        if page > 100:  # safety cap = 20,000 identities
+            break
+    valued=0; total=0.0; currencies=set(); missing=0; comp_count=0
     for item in items:
         cid=item.get("id") or item.get("card_identity_id")
         if not cid: continue
         card=db.get_card(cid)
         comps=(card or {}).get("comps") or []
-        vals=[float(c["price"]) for c in comps if c.get("included_in_valuation",True) and c.get("price") is not None]
+        usable=[c for c in comps if c.get("included_in_valuation",True) and c.get("price") is not None]
+        vals=[float(c["price"]) for c in usable]
+        comp_count += len(usable)
         if not vals:
             missing+=1; continue
         vals.sort(); n=len(vals); med=vals[n//2] if n%2 else (vals[n//2-1]+vals[n//2])/2
         total+=med; valued+=1
-        currencies.update(c.get("currency") for c in comps if c.get("currency"))
+        currencies.update(c.get("currency") for c in usable if c.get("currency"))
     currency=next(iter(currencies)) if len(currencies)==1 else ("MIXED" if currencies else None)
-    return {"cards_considered":len(items),"valued_cards":valued,"cards_without_comps":missing,"estimated_collection_value":round(total,2),"currency":currency,"method":"sum_of_card_comp_medians"}
+    considered=len(items)
+    return {
+        "cards_considered":considered,
+        "valued_cards":valued,
+        "cards_without_comps":missing,
+        "included_comp_count":comp_count,
+        "coverage_pct":round((valued/considered*100),1) if considered else 0.0,
+        "estimated_collection_value":round(total,2) if valued else None,
+        "currency":currency,
+        "method":"sum_of_card_comp_medians",
+        "status":"valued" if valued else "waiting_for_comps"
+    }
 
 @app.get("/api/v1/export/csv")
 def export_csv():
