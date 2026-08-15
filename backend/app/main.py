@@ -17,12 +17,13 @@ from .recognition import analyze_images
 from .catalog import rank_catalog
 from .image_storage import persist_image, signed_url, storage_ready, storage_diagnostics
 from . import postgres_probe
+from .market_providers import build_fingerprint, provider_status, score_candidate
 
 STATIC_INDEX = Path(__file__).resolve().parent.parent / "static" / "index.html"
 
 logger = logging.getLogger("sportscard-vault")
 
-app = FastAPI(title="SportsCard Vault API", version="0.18.1", description="Detailed sports-card collection API with editable scan review, correction learning data, transparent comp-based valuation, and an offline-first test UI.")
+app = FastAPI(title="SportsCard Vault API", version="0.19.0", description="Detailed sports-card collection API with editable scan review, correction learning data, transparent comp-based valuation, and an offline-first test UI.")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=False, allow_methods=["*"], allow_headers=["*"])
 
 from contextlib import asynccontextmanager
@@ -46,7 +47,7 @@ async def lifespan(app: FastAPI):
 app.router.lifespan_context = lifespan
 
 @app.get("/health")
-def health(): return {"status":"ok","version":"0.18.0","environment":settings.app_env,"recognition":settings.recognition_provider,"pricing_provider":settings.price_provider,"database_provider":settings.database_provider}
+def health(): return {"status":"ok","version":"0.19.0","environment":settings.app_env,"recognition":settings.recognition_provider,"pricing_provider":settings.price_provider,"database_provider":settings.database_provider}
 
 
 def _serve_test_ui():
@@ -439,6 +440,53 @@ def card_market(card_id: str):
         "currency":currency,"reliable":len(usable)>=settings.min_reliable_comps,
         "min_reliable_comps":settings.min_reliable_comps,"comps":comps
     }
+
+
+
+@app.get("/api/v1/market/providers")
+def market_provider_status():
+    return {
+        "providers": provider_status(),
+        "automatic_provider_configured": False,
+        "policy": "No AI-invented prices. Provider estimates and verified sold comps remain separate.",
+    }
+
+@app.get("/api/v1/cards/{card_id}/market-fingerprint")
+def card_market_fingerprint(card_id: str):
+    card=db.get_card(card_id)
+    if not card: raise HTTPException(404,"Card not found")
+    fp=build_fingerprint(card)
+    return {
+        "card_id": card_id,
+        "fingerprint": fp.as_dict(),
+        "matching_threshold": 0.82,
+        "hard_identity_fields": ["subject","card_number","parallel_name"],
+    }
+
+@app.post("/api/v1/cards/{card_id}/market/refresh")
+def refresh_card_market(card_id: str):
+    card=db.get_card(card_id)
+    if not card: raise HTTPException(404,"Card not found")
+    fp=build_fingerprint(card)
+    return {
+        "card_id": card_id,
+        "status": "provider_not_configured",
+        "fingerprint": fp.as_dict(),
+        "providers": provider_status(),
+        "new_verified_comps": 0,
+        "new_provider_estimates": 0,
+        "message": "Automatische Marktquelle ist vorbereitet, aber noch nicht aktiviert. Es wurden keine Preise erfunden oder aus aktiven Angeboten abgeleitet.",
+    }
+
+@app.post("/api/v1/market/match-preview")
+def market_match_preview(payload: dict):
+    card_id=payload.get("card_id")
+    candidate=payload.get("candidate") or {}
+    if not card_id: raise HTTPException(422,"card_id required")
+    card=db.get_card(card_id)
+    if not card: raise HTTPException(404,"Card not found")
+    fp=build_fingerprint(card)
+    return {"card_id":card_id,"fingerprint":fp.as_dict(),"match":score_candidate(fp,candidate)}
 
 @app.get("/api/v1/collection/market-summary")
 def collection_market_summary():
