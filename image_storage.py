@@ -238,6 +238,86 @@ def _endpoint_trial(label: str, endpoint: str) -> dict:
     return result
 
 
+
+def _rest_storage_split_trial() -> dict:
+    """V0.15.12: compare Storage REST authentication with S3.
+
+    Uses the direct Storage hostname so the probe does not depend on the
+    project API hostname, which is not resolvable from the current Render
+    environment. The probe is read-only and never exposes credentials.
+    """
+    ref = settings.supabase_project_ref
+    secret = (settings.supabase_secret_key or "").strip()
+    if not ref:
+        return {"configured": False, "reason": "project_ref_missing"}
+    if not secret:
+        return {"configured": False, "reason": "supabase_secret_missing"}
+
+    import httpx
+    from urllib.parse import quote
+
+    base = f"https://{ref}.storage.supabase.co"
+    host = urlparse(base).hostname
+    dns_ok, dns_error = _dns(host)
+    result = {
+        "configured": True,
+        "base_url": base,
+        "host": host,
+        "dns_ok": dns_ok,
+        "dns_error": dns_error,
+        "key_kind": "opaque-secret" if secret.startswith("sb_secret_") else ("legacy-jwt" if secret.startswith("eyJ") else "other"),
+        "key_length": len(secret),
+        "bucket_get_ok": False,
+        "object_list_ok": False,
+    }
+    if not dns_ok:
+        return result
+
+    # New sb_secret_* API keys belong in apikey. Legacy service_role JWTs are
+    # also accepted as bearer credentials by Storage. Supplying both mirrors
+    # the server-side SDK behavior while keeping the value out of diagnostics.
+    headers = {
+        "apikey": secret,
+        "Authorization": f"Bearer {secret}",
+        "User-Agent": "SportsCardVault/0.15.12 Render diagnostic",
+    }
+    bucket_q = quote(settings.supabase_bucket, safe="")
+    bucket_url = f"{base}/storage/v1/bucket/{bucket_q}"
+    list_url = f"{base}/storage/v1/object/list/{bucket_q}"
+    result["bucket_url"] = bucket_url
+    result["list_url"] = list_url
+
+    try:
+        with httpx.Client(timeout=12.0, follow_redirects=False) as client:
+            try:
+                r = client.get(bucket_url, headers=headers)
+                result["bucket_get_status"] = r.status_code
+                result["bucket_get_content_type"] = r.headers.get("content-type")
+                result["bucket_get_request_id"] = r.headers.get("x-request-id") or r.headers.get("sb-request-id")
+                result["bucket_get_body"] = (r.text or "")[:500]
+                result["bucket_get_ok"] = 200 <= r.status_code < 300
+            except Exception as exc:
+                result["bucket_get_exception"] = f"{type(exc).__name__}: {exc}"
+
+            try:
+                r = client.post(
+                    list_url,
+                    headers={**headers, "Content-Type": "application/json"},
+                    json={"limit": 1, "offset": 0, "prefix": ""},
+                )
+                result["object_list_status"] = r.status_code
+                result["object_list_content_type"] = r.headers.get("content-type")
+                result["object_list_request_id"] = r.headers.get("x-request-id") or r.headers.get("sb-request-id")
+                result["object_list_body"] = (r.text or "")[:500]
+                result["object_list_ok"] = 200 <= r.status_code < 300
+            except Exception as exc:
+                result["object_list_exception"] = f"{type(exc).__name__}: {exc}"
+    except Exception as exc:
+        result["client_exception"] = f"{type(exc).__name__}: {exc}"
+
+    result["any_ok"] = bool(result.get("bucket_get_ok") or result.get("object_list_ok"))
+    return result
+
 def storage_diagnostics() -> dict:
     if settings.s3_ready:
         host = urlparse(settings.s3_endpoint or "").hostname
@@ -275,6 +355,14 @@ def storage_diagnostics() -> dict:
         out["endpoint_trials"] = trials
         out["endpoint_trial_any_usable"] = any(t.get("usable") for t in trials)
         out["endpoint_trial_winner"] = next((t.get("label") for t in trials if t.get("usable")), None)
+
+        # V0.15.12: independent Storage REST probe with the server secret.
+        # This cleanly separates "Storage itself/auth works" from "S3
+        # protocol/signing works" without changing production behavior.
+        rest_trial = _rest_storage_split_trial()
+        out["rest_split_trial"] = rest_trial
+        out["rest_split_any_ok"] = bool(rest_trial.get("any_ok"))
+        out["s3_split_any_ok"] = bool(out.get("endpoint_trial_any_usable"))
 
         if not dns_ok:
             return out
