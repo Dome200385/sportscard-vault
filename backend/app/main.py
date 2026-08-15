@@ -22,7 +22,7 @@ STATIC_INDEX = Path(__file__).resolve().parent.parent / "static" / "index.html"
 
 logger = logging.getLogger("sportscard-vault")
 
-app = FastAPI(title="SportsCard Vault API", version="0.17.0", description="Detailed sports-card collection API with editable scan review, correction learning data, transparent comp-based valuation, and an offline-first test UI.")
+app = FastAPI(title="SportsCard Vault API", version="0.18.0", description="Detailed sports-card collection API with editable scan review, correction learning data, transparent comp-based valuation, and an offline-first test UI.")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=False, allow_methods=["*"], allow_headers=["*"])
 
 from contextlib import asynccontextmanager
@@ -46,7 +46,7 @@ async def lifespan(app: FastAPI):
 app.router.lifespan_context = lifespan
 
 @app.get("/health")
-def health(): return {"status":"ok","version":"0.17.0","environment":settings.app_env,"recognition":settings.recognition_provider,"pricing_provider":settings.price_provider,"database_provider":settings.database_provider}
+def health(): return {"status":"ok","version":"0.18.0","environment":settings.app_env,"recognition":settings.recognition_provider,"pricing_provider":settings.price_provider,"database_provider":settings.database_provider}
 
 
 def _serve_test_ui():
@@ -419,6 +419,45 @@ def valuation(card_id: str):
     comps=[Comp(float(c["price"]),c["currency"],c.get("raw_or_graded","raw"),c.get("included_in_valuation",True)) for c in card["comps"]]
     result=calculate_valuation(comps,settings.min_reliable_comps)
     return ValuationOut(**result.__dict__)
+
+
+@app.get("/api/v1/cards/{card_id}/market")
+def card_market(card_id: str):
+    card=db.get_card(card_id)
+    if not card: raise HTTPException(404,"Card not found")
+    comps=card.get("comps") or []
+    usable=[c for c in comps if c.get("included_in_valuation",True) and c.get("price") is not None]
+    vals=[float(c["price"]) for c in usable]
+    vals_sorted=sorted(vals)
+    median=None
+    if vals_sorted:
+        n=len(vals_sorted); median=vals_sorted[n//2] if n%2 else (vals_sorted[n//2-1]+vals_sorted[n//2])/2
+    currency=next((c.get("currency") for c in usable if c.get("currency")), None)
+    return {
+        "card_id":card_id,"comp_count":len(comps),"included_comp_count":len(usable),
+        "median":median,"low":min(vals) if vals else None,"high":max(vals) if vals else None,
+        "currency":currency,"reliable":len(usable)>=settings.min_reliable_comps,
+        "min_reliable_comps":settings.min_reliable_comps,"comps":comps
+    }
+
+@app.get("/api/v1/collection/market-summary")
+def collection_market_summary():
+    listing=db.list_collection(page=1,page_size=200)
+    items=listing.get("items",[]) if isinstance(listing,dict) else []
+    valued=0; total=0.0; currencies=set(); missing=0
+    for item in items:
+        cid=item.get("id") or item.get("card_identity_id")
+        if not cid: continue
+        card=db.get_card(cid)
+        comps=(card or {}).get("comps") or []
+        vals=[float(c["price"]) for c in comps if c.get("included_in_valuation",True) and c.get("price") is not None]
+        if not vals:
+            missing+=1; continue
+        vals.sort(); n=len(vals); med=vals[n//2] if n%2 else (vals[n//2-1]+vals[n//2])/2
+        total+=med; valued+=1
+        currencies.update(c.get("currency") for c in comps if c.get("currency"))
+    currency=next(iter(currencies)) if len(currencies)==1 else ("MIXED" if currencies else None)
+    return {"cards_considered":len(items),"valued_cards":valued,"cards_without_comps":missing,"estimated_collection_value":round(total,2),"currency":currency,"method":"sum_of_card_comp_medians"}
 
 @app.get("/api/v1/export/csv")
 def export_csv():
