@@ -99,6 +99,13 @@ create table if not exists public.market_comps (
   created_at timestamptz not null default now()
 );
 
+create table if not exists public.market_price_snapshots (
+  id uuid primary key default gen_random_uuid(),
+  card_identity_id uuid not null references public.card_identities(id) on delete cascade,
+  data_json jsonb not null default '{}'::jsonb,
+  recorded_at timestamptz not null default now()
+);
+
 create table if not exists public.scan_events (
   id uuid primary key default gen_random_uuid(),
   owner_user_id uuid not null,
@@ -121,6 +128,7 @@ create index if not exists idx_card_identities_cardnum on public.card_identities
 create index if not exists idx_card_instances_user on public.card_instances(owner_user_id);
 create index if not exists idx_card_instances_identity on public.card_instances(card_identity_id);
 create index if not exists idx_market_comps_identity on public.market_comps(card_identity_id, sold_at desc);
+create index if not exists idx_market_price_snapshots_card_time on public.market_price_snapshots(card_identity_id, recorded_at desc);
 
 alter table public.card_identities enable row level security;
 alter table public.card_instances enable row level security;

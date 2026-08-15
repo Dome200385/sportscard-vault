@@ -67,6 +67,20 @@ create table if not exists public.card_image_blobs (
   created_at timestamptz not null default now()
 );
 create index if not exists idx_card_image_blobs_sha256 on public.card_image_blobs(sha256);
+
+create table if not exists public.market_price_snapshots (
+  id uuid primary key default gen_random_uuid(),
+  card_identity_id uuid not null references public.card_identities(id) on delete cascade,
+  value numeric(14,2) not null,
+  currency text not null,
+  source text not null,
+  confidence numeric(5,4),
+  snapshot_type text not null default 'verified_comps',
+  comp_count integer not null default 0,
+  metadata_json jsonb not null default '{}'::jsonb,
+  recorded_at timestamptz not null default now()
+);
+create index if not exists idx_market_price_snapshots_card_time on public.market_price_snapshots(card_identity_id, recorded_at desc);
 '''
 
 
@@ -260,6 +274,40 @@ def add_comp(card_id: str, comp: dict) -> str:
         }
         cid=str(_insert(cur,"market_comps",payload)); con.commit(); return cid
 
+
+
+def add_market_snapshot(card_id: str, snapshot: dict) -> str:
+    sid=str(uuid4())
+    with connect() as con, con.cursor() as cur:
+        cur.execute("select 1 from public.card_identities where id=%s", (card_id,))
+        if not cur.fetchone():
+            raise KeyError(card_id)
+        cur.execute(
+            "insert into public.market_price_snapshots "
+            "(id,card_identity_id,value,currency,source,confidence,snapshot_type,comp_count,metadata_json,recorded_at) "
+            "values (%s,%s,%s,%s,%s,%s,%s,%s,%s,coalesce(%s::timestamptz,now()))",
+            (sid,card_id,float(snapshot['value']),snapshot.get('currency') or 'USD',snapshot.get('source') or 'unknown',
+             snapshot.get('confidence'),snapshot.get('snapshot_type') or 'verified_comps',int(snapshot.get('comp_count') or 0),
+             Jsonb(snapshot.get('metadata') or {}),snapshot.get('recorded_at'))
+        )
+        con.commit()
+    return sid
+
+
+def list_market_snapshots(card_id: str, limit: int = 365) -> list[dict]:
+    limit=min(max(int(limit or 365),1),2000)
+    with connect() as con, con.cursor() as cur:
+        cur.execute(
+            "select id,value,currency,source,confidence,snapshot_type,comp_count,metadata_json,recorded_at "
+            "from public.market_price_snapshots where card_identity_id=%s order by recorded_at asc limit %s",
+            (card_id,limit)
+        )
+        rows=cur.fetchall()
+    return [{
+        'id':str(r['id']),'value':float(r['value']),'currency':r['currency'],'source':r['source'],
+        'confidence':float(r['confidence']) if r['confidence'] is not None else None,'snapshot_type':r['snapshot_type'],
+        'comp_count':int(r['comp_count'] or 0),'metadata':r['metadata_json'] or {},'recorded_at':r['recorded_at']
+    } for r in rows]
 
 def save_scan(front: str, back: str | None, locked_context: dict, output: dict, scan_id: str | None = None) -> str:
     sid=scan_id or str(uuid4())

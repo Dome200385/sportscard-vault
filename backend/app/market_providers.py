@@ -170,7 +170,7 @@ def score_candidate(fp: MarketFingerprint, candidate: dict[str, Any]) -> dict[st
 
 
 def provider_status() -> list[dict[str, Any]]:
-    # V0.19.0 deliberately ships provider-neutral. External paid feeds can be
+    # V0.19.1 deliberately remains provider-neutral. External paid feeds can be
     # enabled later without altering card/valuation data structures.
     return [
         {

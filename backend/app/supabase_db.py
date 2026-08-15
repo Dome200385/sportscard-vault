@@ -179,6 +179,22 @@ def add_comp(card_id: str, comp: dict) -> str:
     return cid
 
 
+
+def add_market_snapshot(card_id: str, snapshot: dict) -> str:
+    sb=client()
+    if not _single_data(sb.table("card_identities").select("id").eq("id",card_id).limit(1).execute()): raise KeyError(card_id)
+    sid=str(uuid4()); payload=dict(snapshot); recorded=payload.pop('recorded_at',None) or now_iso()
+    sb.table("market_price_snapshots").insert({"id":sid,"card_identity_id":card_id,"data_json":payload,"recorded_at":recorded}).execute()
+    return sid
+
+def list_market_snapshots(card_id: str, limit: int = 365) -> list[dict]:
+    limit=min(max(int(limit or 365),1),2000)
+    rows=client().table("market_price_snapshots").select("*").eq("card_identity_id",card_id).order("recorded_at").limit(limit).execute().data or []
+    out=[]
+    for r in rows:
+        d=dict(r.get('data_json') or {}); d['id']=r['id']; d['recorded_at']=r['recorded_at']; out.append(d)
+    return out
+
 def save_scan(front: str, back: str | None, locked_context: dict, output: dict, scan_id: str | None = None) -> str:
     sid = scan_id or str(uuid4())
     client().table("scan_events").insert({
