@@ -73,6 +73,14 @@ class Settings:
     openai_api_key: str | None = _clean_env("OPENAI_API_KEY")
     openai_vision_model: str = _clean_env("OPENAI_VISION_MODEL", "gpt-5.6-terra") or "gpt-5.6-terra"
 
+    # Live sold-market provider (V0.20.0). Server-side only.
+    soldcomps_api_key: str | None = _clean_env("SOLDCOMPS_API_KEY")
+    soldcomps_api_base: str = _clean_env("SOLDCOMPS_API_BASE", "https://api.sold-comps.com") or "https://api.sold-comps.com"
+    soldcomps_ebay_site: str = _clean_env("SOLDCOMPS_EBAY_SITE", "ebay.com") or "ebay.com"
+    soldcomps_days: int = int(_clean_env("SOLDCOMPS_DAYS", "90") or "90")
+    soldcomps_count: int = int(_clean_env("SOLDCOMPS_COUNT", "120") or "120")
+    soldcomps_timeout_seconds: float = float(_clean_env("SOLDCOMPS_TIMEOUT_SECONDS", "30") or "30")
+
     # Persistent collection/storage. Keep these server-side only.
     supabase_url: str | None = _normalize_supabase_url(_clean_env("SUPABASE_URL"))
     supabase_secret_key: str | None = _clean_env("SUPABASE_SECRET_KEY") or _clean_env("SUPABASE_SERVICE_ROLE_KEY")

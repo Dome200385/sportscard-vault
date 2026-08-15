@@ -18,13 +18,13 @@ from .recognition import analyze_images
 from .catalog import rank_catalog
 from .image_storage import persist_image, signed_url, storage_ready, storage_diagnostics
 from . import postgres_probe
-from .market_providers import build_fingerprint, provider_status, score_candidate
+from .market_providers import (build_fingerprint, provider_status, score_candidate, soldcomps_search, normalize_soldcomps_results, SoldCompsError)
 
 STATIC_INDEX = Path(__file__).resolve().parent.parent / "static" / "index.html"
 
 logger = logging.getLogger("sportscard-vault")
 
-app = FastAPI(title="SportsCard Vault API", version="0.19.1", description="Detailed sports-card collection API with editable scan review, correction learning data, transparent comp-based valuation, and an offline-first test UI.")
+app = FastAPI(title="SportsCard Vault API", version="0.20.0", description="Detailed sports-card collection API with editable scan review, correction learning data, transparent comp-based valuation, and an offline-first test UI.")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=False, allow_methods=["*"], allow_headers=["*"])
 
 from contextlib import asynccontextmanager
@@ -48,7 +48,7 @@ async def lifespan(app: FastAPI):
 app.router.lifespan_context = lifespan
 
 @app.get("/health")
-def health(): return {"status":"ok","version":"0.19.1","environment":settings.app_env,"recognition":settings.recognition_provider,"pricing_provider":settings.price_provider,"database_provider":settings.database_provider}
+def health(): return {"status":"ok","version":"0.20.0","environment":settings.app_env,"recognition":settings.recognition_provider,"pricing_provider":settings.price_provider,"database_provider":settings.database_provider}
 
 
 def _serve_test_ui():
@@ -534,8 +534,8 @@ def card_market_history(card_id: str, limit: int = Query(365,ge=1,le=2000)):
 def market_provider_status():
     return {
         "providers": provider_status(),
-        "automatic_provider_configured": False,
-        "policy": "No AI-invented prices. Provider estimates and verified sold comps remain separate.",
+        "automatic_provider_configured": bool(settings.soldcomps_api_key),
+        "policy": "Only completed sold listings are used as automatic comps. Asking prices and AI-invented prices are excluded.",
     }
 
 @app.get("/api/v1/cards/{card_id}/market-fingerprint")
@@ -546,25 +546,97 @@ def card_market_fingerprint(card_id: str):
     return {
         "card_id": card_id,
         "fingerprint": fp.as_dict(),
-        "matching_threshold": 0.82,
-        "hard_identity_fields": ["subject","card_number","parallel_name"],
+        "matching_threshold": 0.72,
+        "hard_identity_fields": ["subject","card_number","parallel_name","raw_or_graded"],
     }
+
+
+def _ingest_soldcomps_search(card_id: str, card: dict, search: dict) -> dict:
+    fp=build_fingerprint(card)
+    normalized=normalize_soldcomps_results(fp, search)
+    existing_ids={str(c.get('source_item_id')) for c in (card.get('comps') or []) if c.get('source_item_id')}
+    added=0; included=0; excluded=0
+    for row in normalized.get('matches') or []:
+        item=row['item']; item_id=str(item.get('itemId') or '')
+        if item_id and item_id in existing_ids:
+            continue
+        comp={
+            'source':'soldcomps_ebay',
+            'source_item_id':item_id or None,
+            'source_url':item.get('url'),
+            'sale_type':item.get('buyingFormat') or 'sold',
+            'sold_at':item.get('endedAt'),
+            # Use all-in transaction cost when SoldComps supplies it; this keeps
+            # shipping treatment consistent across comps.
+            'price':row.get('all_in_price'),
+            'currency':row.get('currency') or 'USD',
+            'shipping_price':item.get('shippingPrice'),
+            'all_in_price':row.get('all_in_price'),
+            'raw_or_graded':fp.raw_or_graded or 'raw',
+            'grading_company':fp.grading_company,
+            'grade_numeric':fp.grade_numeric,
+            'title_raw':item.get('title'),
+            'matched_identity_confidence':row['match'].get('score'),
+            'included_in_valuation':bool(row.get('included_in_valuation')),
+            'exclusion_reason':row.get('exclusion_reason'),
+            'provider_metadata':{
+                'thumbnail_url':item.get('thumbnailUrl'),
+                'full_res_thumbnail_url':item.get('fullResThumbnailUrl'),
+                'condition':item.get('condition'),
+                'best_offer_accepted':item.get('bestOfferAccepted'),
+                'seller_feedback_score':item.get('sellerFeedbackScore'),
+                'match_evidence':row['match'].get('evidence'),
+                'query':normalized.get('query'),
+            },
+        }
+        try:
+            db.add_comp(card_id,comp)
+            added += 1
+            if comp['included_in_valuation']: included += 1
+            else: excluded += 1
+            if item_id: existing_ids.add(item_id)
+        except Exception as exc:
+            logger.warning("Could not persist SoldComps item %s for card %s: %s", item_id, card_id, exc)
+    snapshot_id=_record_current_market_snapshot(card_id,'verified_comps') if added else None
+    current=_card_market_state(card_id)
+    return {
+        'query':normalized.get('query'),'raw_results':normalized.get('raw_count',0),
+        'identity_matches':normalized.get('matched_count',0),'included_matches':normalized.get('included_count',0),
+        'rejected_count':normalized.get('rejected_count',0),'new_comps':added,
+        'new_included_comps':included,'new_excluded_outliers':excluded,'snapshot_id':snapshot_id,
+        'rejected_preview':normalized.get('rejected_preview',[]),
+        'current_market':{k:current[k] for k in ['current_value','currency','source','confidence','last_updated','change_7d_pct','change_30d_pct','included_comp_count','reliable']},
+    }
+
 
 @app.post("/api/v1/cards/{card_id}/market/refresh")
 def refresh_card_market(card_id: str):
     card=db.get_card(card_id)
     if not card: raise HTTPException(404,"Card not found")
     fp=build_fingerprint(card)
-    state=_card_market_state(card_id)
+    if not settings.soldcomps_api_key:
+        state=_card_market_state(card_id)
+        return {
+            "card_id": card_id,"status": "provider_not_configured","fingerprint": fp.as_dict(),
+            "providers": provider_status(),"new_verified_comps": 0,"new_provider_estimates": 0,
+            "current_market": {k:state[k] for k in ['current_value','currency','source','confidence','last_updated','change_7d_pct','change_30d_pct']},
+            "message": "SoldComps ist noch nicht konfiguriert. Es wurden keine Preise erfunden oder aus aktiven Angeboten abgeleitet.",
+        }
+    try:
+        search=soldcomps_search(fp)
+        result=_ingest_soldcomps_search(card_id,card,search)
+    except SoldCompsError as exc:
+        status='quota_exceeded' if exc.code=='quota_exceeded' else 'provider_error'
+        return {
+            'card_id':card_id,'status':status,'fingerprint':fp.as_dict(),'providers':provider_status(),
+            'new_verified_comps':0,'new_provider_estimates':0,
+            'provider_http_status':exc.status_code,'provider_error_code':exc.code,
+            'message':str(exc),
+        }
     return {
-        "card_id": card_id,
-        "status": "provider_not_configured",
-        "fingerprint": fp.as_dict(),
-        "providers": provider_status(),
-        "new_verified_comps": 0,
-        "new_provider_estimates": 0,
-        "current_market": {k:state[k] for k in ['current_value','currency','source','confidence','last_updated','change_7d_pct','change_30d_pct']},
-        "message": "Automatische Marktquelle ist vorbereitet, aber noch nicht aktiviert. Es wurden keine Preise erfunden oder aus aktiven Angeboten abgeleitet.",
+        'card_id':card_id,'status':'updated','fingerprint':fp.as_dict(),'providers':provider_status(),
+        'new_verified_comps':result['new_comps'],'new_provider_estimates':0,'soldcomps':result,
+        'message':f"SoldComps geprüft: {result['raw_results']} Verkäufe, {result['identity_matches']} Identitäts-Matches, {result['new_comps']} neue Comps gespeichert.",
     }
 
 @app.post("/api/v1/market/match-preview")
@@ -627,10 +699,42 @@ def refresh_collection_market():
         items.extend(batch)
         if len(batch)<200 or page>=100: break
         page+=1
+    if not settings.soldcomps_api_key:
+        return {
+            'status':'provider_not_configured','cards_checked':len(items),'cards_updated':0,
+            'providers':provider_status(),
+            'message':'SoldComps ist nicht konfiguriert; bestehende verifizierte Comps und Preis-Historie bleiben unverändert.'
+        }
+
+    # One provider request per unique fingerprint query. Duplicate physical cards
+    # therefore do not burn multiple credits during the same collection refresh.
+    search_cache: dict[str, dict] = {}
+    cards_updated=0; new_comps=0; requests_used=0; errors=[]; details=[]
+    for item in items:
+        cid=item.get('id') or item.get('card_identity_id')
+        if not cid: continue
+        card=db.get_card(cid)
+        if not card: continue
+        fp=build_fingerprint(card); query=fp.soldcomps_query().strip()
+        if not query:
+            details.append({'card_id':cid,'status':'insufficient_fingerprint'}); continue
+        try:
+            if query not in search_cache:
+                search_cache[query]=soldcomps_search(fp); requests_used += 1
+            result=_ingest_soldcomps_search(cid,card,search_cache[query])
+            if result['new_comps']>0: cards_updated += 1
+            new_comps += result['new_comps']
+            details.append({'card_id':cid,'status':'updated',**{k:result[k] for k in ['query','raw_results','identity_matches','new_comps','new_included_comps']}})
+        except SoldCompsError as exc:
+            errors.append({'card_id':cid,'query':query,'http_status':exc.status_code,'code':exc.code,'message':str(exc)})
+            if exc.code=='quota_exceeded': break
+        except Exception as exc:
+            errors.append({'card_id':cid,'query':query,'message':f'{type(exc).__name__}: {exc}'})
     return {
-        'status':'provider_not_configured','cards_checked':len(items),'cards_updated':0,
-        'providers':provider_status(),
-        'message':'Sammlung geprüft. Noch keine automatische Marktquelle aktiviert; bestehende verifizierte Comps und Preis-Historie bleiben unverändert.'
+        'status':'updated' if not errors else ('partial' if new_comps or cards_updated else 'provider_error'),
+        'cards_checked':len(items),'cards_updated':cards_updated,'new_verified_comps':new_comps,
+        'provider_requests_used':requests_used,'providers':provider_status(),'errors':errors,'details':details,
+        'message':f'SoldComps: {requests_used} API-Abfragen, {new_comps} neue Vergleichsverkäufe gespeichert, {cards_updated} Karten aktualisiert.'
     }
 
 @app.get("/api/v1/export/csv")

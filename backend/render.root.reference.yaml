@@ -20,6 +20,8 @@ services:
         value: manual
       - key: MIN_RELIABLE_COMPS
         value: 3
+      - key: SOLDCOMPS_API_KEY
+        sync: false
       - key: DATABASE_PROVIDER
         value: sqlite
       - key: DATABASE_PATH
