@@ -56,6 +56,17 @@ create table if not exists public.scan_corrections (
   created_at timestamptz not null default now()
 );
 create index if not exists idx_scan_corrections_scan on public.scan_corrections(scan_id);
+
+create table if not exists public.card_image_blobs (
+  id uuid primary key default gen_random_uuid(),
+  content_type text not null default 'image/jpeg',
+  original_name text,
+  data bytea not null,
+  byte_size integer not null,
+  sha256 text not null,
+  created_at timestamptz not null default now()
+);
+create index if not exists idx_card_image_blobs_sha256 on public.card_image_blobs(sha256);
 '''
 
 
@@ -332,3 +343,51 @@ def export_rows()->list[dict]:
         for inst in by.get(ident["id"],[]):
             d=dict(ident["data_json"] or {}); d.update({f"owned_{k}":v for k,v in (inst["data_json"] or {}).items()}); d["card_identity_id"]=str(ident["id"]); d["instance_id"]=str(inst["id"]); out.append(d)
     return out
+
+
+def persist_image_blob(data: bytes, content_type: str = "image/jpeg", original_name: str | None = None) -> str:
+    """Persist an image in Postgres as a durable fallback when Storage routing is unavailable."""
+    digest = hashlib.sha256(data).hexdigest()
+    with connect() as con:
+        with con.cursor() as cur:
+            cur.execute(
+                "select id from public.card_image_blobs where sha256=%s and byte_size=%s limit 1",
+                (digest, len(data)),
+            )
+            row = cur.fetchone()
+            if row:
+                image_id = str(row["id"])
+            else:
+                cur.execute(
+                    "insert into public.card_image_blobs (content_type, original_name, data, byte_size, sha256) values (%s,%s,%s,%s,%s) returning id",
+                    (content_type or "application/octet-stream", original_name, data, len(data), digest),
+                )
+                image_id = str(cur.fetchone()["id"])
+        con.commit()
+    return image_id
+
+
+def get_image_blob(image_id: str) -> dict | None:
+    try:
+        image_uuid = UUID(image_id)
+    except Exception:
+        return None
+    with connect() as con, con.cursor() as cur:
+        cur.execute(
+            "select id, content_type, original_name, data, byte_size, sha256, created_at from public.card_image_blobs where id=%s",
+            (image_uuid,),
+        )
+        row = cur.fetchone()
+        return dict(row) if row else None
+
+
+def image_blob_ready() -> tuple[bool, str | None]:
+    if not settings.supabase_database_url:
+        return False, "SUPABASE_DATABASE_URL fehlt"
+    try:
+        with connect() as con, con.cursor() as cur:
+            cur.execute("select count(*) as n from public.card_image_blobs")
+            cur.fetchone()
+        return True, None
+    except Exception as exc:
+        return False, f"Postgres image blob check failed: {type(exc).__name__}: {exc}"

@@ -318,6 +318,17 @@ def _rest_storage_split_trial() -> dict:
     result["any_ok"] = bool(result.get("bucket_get_ok") or result.get("object_list_ok"))
     return result
 
+def _postgres_image_fallback_status() -> dict:
+    if not settings.supabase_database_url:
+        return {"configured": False, "ready": False, "error": "SUPABASE_DATABASE_URL fehlt"}
+    try:
+        from .postgres_db import image_blob_ready
+        ok, error = image_blob_ready()
+        return {"configured": True, "ready": bool(ok), "error": error}
+    except Exception as exc:
+        return {"configured": True, "ready": False, "error": f"{type(exc).__name__}: {exc}"}
+
+
 def storage_diagnostics() -> dict:
     if settings.s3_ready:
         host = urlparse(settings.s3_endpoint or "").hostname
@@ -364,7 +375,24 @@ def storage_diagnostics() -> dict:
         out["rest_split_any_ok"] = bool(rest_trial.get("any_ok"))
         out["s3_split_any_ok"] = bool(out.get("endpoint_trial_any_usable"))
 
+        # V0.15.13: durable fallback through the already-working Postgres
+        # connection. This lets scans remain persistent even while Supabase
+        # Storage routing returns "Project not specified" / HTTP 400.
+        pg_image = _postgres_image_fallback_status()
+        out["postgres_image_fallback_configured"] = pg_image.get("configured")
+        out["postgres_image_fallback_ready"] = pg_image.get("ready")
+        out["postgres_image_fallback_error"] = pg_image.get("error")
+
         if not dns_ok:
+            if pg_image.get("ready"):
+                out.update({
+                    "provider": "postgres-image-fallback",
+                    "sdk": "psycopg",
+                    "bucket_exists": True,
+                    "object_access_ok": True,
+                    "bucket_probe_method": "postgres_image_blob_table",
+                    "error": None,
+                })
             return out
 
         client = _s3_client()
@@ -408,6 +436,14 @@ def storage_diagnostics() -> dict:
             out["bucket_exists"] = True
             out["object_access_ok"] = True
             out["bucket_probe_method"] = "boto3_write_head_delete_probe"
+            out["error"] = None
+        elif out.get("postgres_image_fallback_ready"):
+            out["provider"] = "postgres-image-fallback"
+            out["sdk"] = "psycopg"
+            out["bucket_exists"] = True
+            out["object_access_ok"] = True
+            out["bucket_probe_method"] = "postgres_image_blob_table"
+            out["s3_error_preserved"] = out.get("error")
             out["error"] = None
         return out
 
@@ -477,7 +513,16 @@ def persist_image(local_path: str | None, prefix: str, side: str) -> str | None:
                 )
             return f"s3://{settings.supabase_bucket}/{object_path}"
         except Exception:
-            return local_path
+            # Render currently reaches the Storage host but Supabase returns
+            # HTTP 400/"Project not specified". Persist the image in the
+            # already-working Postgres database instead of losing it on /tmp.
+            if settings.supabase_database_url:
+                try:
+                    from .postgres_db import persist_image_blob
+                    image_id = persist_image_blob(path.read_bytes(), content_type, path.name)
+                    return f"pgimg://{image_id}"
+                except Exception:
+                    pass
 
     if settings.supabase_ready:
         try:
@@ -489,14 +534,31 @@ def persist_image(local_path: str | None, prefix: str, side: str) -> str | None:
                 )
             return f"sb://{settings.supabase_bucket}/{object_path}"
         except Exception:
+            if settings.supabase_database_url:
+                try:
+                    from .postgres_db import persist_image_blob
+                    image_id = persist_image_blob(path.read_bytes(), content_type, path.name)
+                    return f"pgimg://{image_id}"
+                except Exception:
+                    pass
             return local_path
 
+    if settings.supabase_database_url:
+        try:
+            from .postgres_db import persist_image_blob
+            image_id = persist_image_blob(path.read_bytes(), content_type, path.name)
+            return f"pgimg://{image_id}"
+        except Exception:
+            pass
     return local_path
 
 
 def signed_url(ref: str | None, expires_in: int = 3600) -> str | None:
     if not ref:
         return None
+    if ref.startswith("pgimg://"):
+        image_id = ref.split("://", 1)[1]
+        return f"/api/v1/images/{image_id}"
     if ref.startswith(("s3://", "sb://")):
         _, rest = ref.split("://", 1)
         bucket, object_path = rest.split("/", 1)

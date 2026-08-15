@@ -8,7 +8,7 @@ from pathlib import Path
 from uuid import uuid4
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse, FileResponse
+from fastapi.responses import StreamingResponse, FileResponse, Response
 from .config import settings
 from . import db
 from .schemas import CardCreateRequest, ManualCompIn, ScanResponse, ConfirmScanRequest, AutoConfirmScanRequest, ValuationOut, CardIdentityIn, OwnedInstanceIn
@@ -22,7 +22,7 @@ STATIC_INDEX = Path(__file__).resolve().parent.parent / "static" / "index.html"
 
 logger = logging.getLogger("sportscard-vault")
 
-app = FastAPI(title="SportsCard Vault API", version="0.15.12", description="Detailed sports-card collection API with editable scan review, correction learning data, transparent comp-based valuation, and an offline-first test UI.")
+app = FastAPI(title="SportsCard Vault API", version="0.15.13", description="Detailed sports-card collection API with editable scan review, correction learning data, transparent comp-based valuation, and an offline-first test UI.")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=False, allow_methods=["*"], allow_headers=["*"])
 
 from contextlib import asynccontextmanager
@@ -46,7 +46,7 @@ async def lifespan(app: FastAPI):
 app.router.lifespan_context = lifespan
 
 @app.get("/health")
-def health(): return {"status":"ok","version":"0.15.12","environment":settings.app_env,"recognition":settings.recognition_provider,"pricing_provider":settings.price_provider,"database_provider":settings.database_provider}
+def health(): return {"status":"ok","version":"0.15.13","environment":settings.app_env,"recognition":settings.recognition_provider,"pricing_provider":settings.price_provider,"database_provider":settings.database_provider}
 
 
 @app.get("/", include_in_schema=False)
@@ -96,7 +96,7 @@ def system_preflight():
 
 @app.get("/api/v1/system/persistence-check")
 def persistence_check():
-    """Non-destructive production-persistence diagnostics (V0.15.12)."""
+    """Non-destructive production-persistence diagnostics (V0.15.13)."""
     requested = (settings.database_provider or "sqlite").lower()
     status = db.provider_status()
     storage = storage_diagnostics()
@@ -128,6 +128,10 @@ def persistence_check():
         "storage_dns_ok": storage.get("dns_ok"),
         "storage_provider": storage.get("provider"),
         "storage_sdk": storage.get("sdk"),
+        "storage_postgres_image_fallback_configured": storage.get("postgres_image_fallback_configured"),
+        "storage_postgres_image_fallback_ready": storage.get("postgres_image_fallback_ready"),
+        "storage_postgres_image_fallback_error": storage.get("postgres_image_fallback_error"),
+        "storage_s3_error_preserved": storage.get("s3_error_preserved"),
         "storage_endpoint_trials": storage.get("endpoint_trials"),
         "storage_endpoint_trial_any_usable": storage.get("endpoint_trial_any_usable"),
         "storage_endpoint_trial_winner": storage.get("endpoint_trial_winner"),
@@ -197,6 +201,23 @@ def persistence_check():
     )
     checks["errors"] = list(dict.fromkeys(errors))
     return checks
+
+@app.get("/api/v1/images/{image_id}", include_in_schema=True)
+def image_blob(image_id: str):
+    """Serve an image persisted in Postgres fallback storage."""
+    try:
+        from .postgres_db import get_image_blob
+        row = get_image_blob(image_id)
+    except Exception as exc:
+        logger.exception("image blob read failed")
+        raise HTTPException(500, detail=f"Image read failed: {type(exc).__name__}")
+    if not row:
+        raise HTTPException(404, "Image not found")
+    return Response(
+        content=bytes(row["data"]),
+        media_type=row.get("content_type") or "application/octet-stream",
+        headers={"Cache-Control": "private, max-age=3600"},
+    )
 
 @app.get("/api/v1/collection/summary")
 def collection_summary():
