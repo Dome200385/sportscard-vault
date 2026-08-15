@@ -205,6 +205,10 @@ def persistence_check():
 @app.get("/api/v1/images/{image_id}", include_in_schema=True)
 def image_blob(image_id: str):
     """Serve an image persisted in Postgres fallback storage."""
+    # Accept a copied pgimg:// reference as well as the bare UUID.
+    image_id = (image_id or "").strip()
+    if image_id.startswith("pgimg://"):
+        image_id = image_id.split("://", 1)[1]
     try:
         from .postgres_db import get_image_blob
         row = get_image_blob(image_id)

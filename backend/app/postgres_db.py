@@ -346,7 +346,11 @@ def export_rows()->list[dict]:
 
 
 def persist_image_blob(data: bytes, content_type: str = "image/jpeg", original_name: str | None = None) -> str:
-    """Persist an image in Postgres as a durable fallback when Storage routing is unavailable."""
+    """Persist an image and verify it is immediately readable before returning its id.
+
+    V0.15.14 hardens the Postgres fallback against false-positive writes. The
+    caller only receives a pgimg id after a fresh connection can read the row.
+    """
     digest = hashlib.sha256(data).hexdigest()
     with connect() as con:
         with con.cursor() as cur:
@@ -364,30 +368,66 @@ def persist_image_blob(data: bytes, content_type: str = "image/jpeg", original_n
                 )
                 image_id = str(cur.fetchone()["id"])
         con.commit()
+
+    # Verify through a new database connection. This catches pooler/transaction
+    # surprises before a scan stores a dangling pgimg:// reference.
+    check = get_image_blob(image_id)
+    if not check or int(check.get("byte_size") or -1) != len(data):
+        raise RuntimeError(f"Postgres image write verification failed for {image_id}")
     return image_id
 
 
 def get_image_blob(image_id: str) -> dict | None:
+    # Accept both the bare UUID used by the HTTP route and pgimg:// references.
+    image_id = (image_id or "").strip()
+    if image_id.startswith("pgimg://"):
+        image_id = image_id.split("://", 1)[1]
     try:
-        image_uuid = UUID(image_id)
+        UUID(image_id)
     except Exception:
         return None
+    # Compare as text rather than relying on UUID adaptation through the pooler.
     with connect() as con, con.cursor() as cur:
         cur.execute(
-            "select id, content_type, original_name, data, byte_size, sha256, created_at from public.card_image_blobs where id=%s",
-            (image_uuid,),
+            "select id, content_type, original_name, data, byte_size, sha256, created_at "
+            "from public.card_image_blobs where id::text=%s limit 1",
+            (image_id,),
         )
         row = cur.fetchone()
         return dict(row) if row else None
 
 
 def image_blob_ready() -> tuple[bool, str | None]:
+    """Prove that the fallback can write, re-read and delete a blob.
+
+    Merely checking that the table exists produced a false green state in
+    V0.15.13. This probe verifies the exact persistence path used by scans.
+    """
     if not settings.supabase_database_url:
         return False, "SUPABASE_DATABASE_URL fehlt"
+    probe_id = None
+    payload = b"sportscard-vault-image-probe-v0.15.14"
     try:
+        digest = hashlib.sha256(payload).hexdigest()
         with connect() as con, con.cursor() as cur:
-            cur.execute("select count(*) as n from public.card_image_blobs")
-            cur.fetchone()
+            cur.execute(
+                "insert into public.card_image_blobs (content_type, original_name, data, byte_size, sha256) "
+                "values (%s,%s,%s,%s,%s) returning id",
+                ("application/octet-stream", "_health_probe.bin", payload, len(payload), digest),
+            )
+            probe_id = str(cur.fetchone()["id"])
+            con.commit()
+        row = get_image_blob(probe_id)
+        if not row or bytes(row["data"]) != payload:
+            return False, "Postgres image blob re-read failed"
         return True, None
     except Exception as exc:
-        return False, f"Postgres image blob check failed: {type(exc).__name__}: {exc}"
+        return False, f"Postgres image blob probe failed: {type(exc).__name__}: {exc}"
+    finally:
+        if probe_id:
+            try:
+                with connect() as con, con.cursor() as cur:
+                    cur.execute("delete from public.card_image_blobs where id::text=%s", (probe_id,))
+                    con.commit()
+            except Exception:
+                pass
