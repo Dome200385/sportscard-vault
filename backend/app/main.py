@@ -22,7 +22,7 @@ STATIC_INDEX = Path(__file__).resolve().parent.parent / "static" / "index.html"
 
 logger = logging.getLogger("sportscard-vault")
 
-app = FastAPI(title="SportsCard Vault API", version="0.15.13", description="Detailed sports-card collection API with editable scan review, correction learning data, transparent comp-based valuation, and an offline-first test UI.")
+app = FastAPI(title="SportsCard Vault API", version="0.15.15", description="Detailed sports-card collection API with editable scan review, correction learning data, transparent comp-based valuation, and an offline-first test UI.")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=False, allow_methods=["*"], allow_headers=["*"])
 
 from contextlib import asynccontextmanager
@@ -46,7 +46,7 @@ async def lifespan(app: FastAPI):
 app.router.lifespan_context = lifespan
 
 @app.get("/health")
-def health(): return {"status":"ok","version":"0.15.13","environment":settings.app_env,"recognition":settings.recognition_provider,"pricing_provider":settings.price_provider,"database_provider":settings.database_provider}
+def health(): return {"status":"ok","version":"0.15.15","environment":settings.app_env,"recognition":settings.recognition_provider,"pricing_provider":settings.price_provider,"database_provider":settings.database_provider}
 
 
 @app.get("/", include_in_schema=False)
@@ -202,6 +202,16 @@ def persistence_check():
     checks["errors"] = list(dict.fromkeys(errors))
     return checks
 
+@app.get("/api/v1/images/{image_id}/meta", include_in_schema=True)
+def image_blob_metadata(image_id: str):
+    """Safe metadata-only check for a Postgres image blob."""
+    try:
+        from .postgres_db import image_blob_meta
+        return image_blob_meta(image_id)
+    except Exception as exc:
+        logger.exception("image blob metadata read failed")
+        raise HTTPException(500, detail=f"Image metadata read failed: {type(exc).__name__}")
+
 @app.get("/api/v1/images/{image_id}", include_in_schema=True)
 def image_blob(image_id: str):
     """Serve an image persisted in Postgres fallback storage."""
@@ -220,7 +230,7 @@ def image_blob(image_id: str):
     return Response(
         content=bytes(row["data"]),
         media_type=row.get("content_type") or "application/octet-stream",
-        headers={"Cache-Control": "private, max-age=3600"},
+        headers={"Cache-Control": "private, max-age=3600", "X-Image-Storage": "postgres"},
     )
 
 @app.get("/api/v1/collection/summary")

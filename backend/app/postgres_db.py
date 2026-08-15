@@ -346,55 +346,70 @@ def export_rows()->list[dict]:
 
 
 def persist_image_blob(data: bytes, content_type: str = "image/jpeg", original_name: str | None = None) -> str:
-    """Persist an image and verify it is immediately readable before returning its id.
+    """Persist every upload as a fresh blob and verify it through a new connection.
 
-    V0.15.14 hardens the Postgres fallback against false-positive writes. The
-    caller only receives a pgimg id after a fresh connection can read the row.
+    V0.15.15 deliberately disables SHA-based blob reuse. A scan must never inherit
+    an older pgimg id whose row may have been created by a previous broken build.
+    The UUID is generated application-side, inserted explicitly, committed, and
+    then re-read using a UUID-typed predicate.
     """
     digest = hashlib.sha256(data).hexdigest()
+    image_uuid = uuid4()
     with connect() as con:
         with con.cursor() as cur:
             cur.execute(
-                "select id from public.card_image_blobs where sha256=%s and byte_size=%s limit 1",
-                (digest, len(data)),
+                "insert into public.card_image_blobs "
+                "(id, content_type, original_name, data, byte_size, sha256) "
+                "values (%s,%s,%s,%s,%s,%s) returning id",
+                (image_uuid, content_type or "application/octet-stream", original_name, data, len(data), digest),
             )
-            row = cur.fetchone()
-            if row:
-                image_id = str(row["id"])
-            else:
-                cur.execute(
-                    "insert into public.card_image_blobs (content_type, original_name, data, byte_size, sha256) values (%s,%s,%s,%s,%s) returning id",
-                    (content_type or "application/octet-stream", original_name, data, len(data), digest),
-                )
-                image_id = str(cur.fetchone()["id"])
+            returned = cur.fetchone()
+            if not returned or str(returned["id"]) != str(image_uuid):
+                raise RuntimeError("Postgres image insert did not return the requested UUID")
         con.commit()
 
-    # Verify through a new database connection. This catches pooler/transaction
-    # surprises before a scan stores a dangling pgimg:// reference.
-    check = get_image_blob(image_id)
-    if not check or int(check.get("byte_size") or -1) != len(data):
-        raise RuntimeError(f"Postgres image write verification failed for {image_id}")
-    return image_id
+    check = get_image_blob(str(image_uuid))
+    if not check:
+        raise RuntimeError(f"Postgres image write verification failed: row {image_uuid} not readable")
+    if int(check.get("byte_size") or -1) != len(data):
+        raise RuntimeError(f"Postgres image write verification failed: byte size mismatch for {image_uuid}")
+    if str(check.get("sha256") or "") != digest:
+        raise RuntimeError(f"Postgres image write verification failed: sha256 mismatch for {image_uuid}")
+    return str(image_uuid)
 
 
 def get_image_blob(image_id: str) -> dict | None:
-    # Accept both the bare UUID used by the HTTP route and pgimg:// references.
     image_id = (image_id or "").strip()
     if image_id.startswith("pgimg://"):
         image_id = image_id.split("://", 1)[1]
     try:
-        UUID(image_id)
+        image_uuid = UUID(image_id)
     except Exception:
         return None
-    # Compare as text rather than relying on UUID adaptation through the pooler.
     with connect() as con, con.cursor() as cur:
         cur.execute(
             "select id, content_type, original_name, data, byte_size, sha256, created_at "
-            "from public.card_image_blobs where id::text=%s limit 1",
-            (image_id,),
+            "from public.card_image_blobs where id=%s limit 1",
+            (image_uuid,),
         )
         row = cur.fetchone()
         return dict(row) if row else None
+
+
+def image_blob_meta(image_id: str) -> dict:
+    """Safe diagnostics for one blob; never returns the binary payload."""
+    row = get_image_blob(image_id)
+    if not row:
+        return {"exists": False, "image_id": (image_id or "").replace("pgimg://", "")}
+    return {
+        "exists": True,
+        "image_id": str(row["id"]),
+        "content_type": row.get("content_type"),
+        "original_name": row.get("original_name"),
+        "byte_size": int(row.get("byte_size") or 0),
+        "sha256": row.get("sha256"),
+        "created_at": row.get("created_at").isoformat() if row.get("created_at") else None,
+    }
 
 
 def image_blob_ready() -> tuple[bool, str | None]:
@@ -406,7 +421,7 @@ def image_blob_ready() -> tuple[bool, str | None]:
     if not settings.supabase_database_url:
         return False, "SUPABASE_DATABASE_URL fehlt"
     probe_id = None
-    payload = b"sportscard-vault-image-probe-v0.15.14"
+    payload = b"sportscard-vault-image-probe-v0.15.15"
     try:
         digest = hashlib.sha256(payload).hexdigest()
         with connect() as con, con.cursor() as cur:
