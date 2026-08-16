@@ -25,7 +25,7 @@ STATIC_INDEX = Path(__file__).resolve().parent.parent / "static" / "index.html"
 
 logger = logging.getLogger("sportscard-vault")
 
-app = FastAPI(title="SportsCard Vault API", version="0.22.0", description="Detailed sports-card collection API with editable scan review, correction learning data, transparent comp-based valuation, and an offline-first test UI.")
+app = FastAPI(title="SportsCard Vault API", version="0.22.2", description="Detailed sports-card collection API with editable scan review, correction learning data, transparent comp-based valuation, and an offline-first test UI.")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=False, allow_methods=["*"], allow_headers=["*"])
 
 from contextlib import asynccontextmanager
@@ -49,13 +49,22 @@ async def lifespan(app: FastAPI):
 app.router.lifespan_context = lifespan
 
 @app.get("/health")
-def health(): return {"status":"ok","version":"0.22.0","environment":settings.app_env,"recognition":settings.recognition_provider,"pricing_provider":settings.price_provider,"database_provider":settings.database_provider}
+def health(): return {"status":"ok","version":"0.22.2","environment":settings.app_env,"recognition":settings.recognition_provider,"pricing_provider":settings.price_provider,"database_provider":settings.database_provider}
 
 
 def _serve_test_ui():
     if STATIC_INDEX.exists():
-        return FileResponse(STATIC_INDEX)
-    return {"name":"SportsCard Vault","status":"ok"}
+        # V0.22.2: always serve the deployed backend/static dashboard and
+        # prevent browsers/CDNs from holding on to an older UI after deploys.
+        return FileResponse(
+            STATIC_INDEX,
+            headers={
+                "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+                "Pragma": "no-cache",
+                "Expires": "0",
+            },
+        )
+    return {"name":"SportsCard Vault","status":"ok","ui_path":str(STATIC_INDEX)}
 
 @app.get("/", include_in_schema=False)
 def test_ui():
@@ -704,10 +713,36 @@ def _record_collection_market_snapshot(reason: str = "market_refresh") -> str | 
         return db.add_collection_market_snapshot({
             "value":value,"currency":currency,"valued_cards":summary.get("valued_cards") or 0,
             "total_cards":summary.get("cards_considered") or 0,"included_comp_count":summary.get("included_comp_count") or 0,
-            "metadata":{"reason":reason,"coverage_pct":summary.get("coverage_pct") or 0}
+            "metadata":{
+                "reason":reason,"coverage_pct":summary.get("coverage_pct") or 0,
+                "positions":{
+                    cid:{"value":round(float(state.get("current_value")),2),"currency":state.get("currency") or currency}
+                    for cid,state in (summary.get("cards") or {}).items() if state.get("current_value") is not None
+                }
+            }
         })
     except Exception:
         return None
+
+@app.post("/api/v1/collection/market/performance-baseline")
+def create_collection_performance_baseline():
+    """Create one holdings-aware snapshot when V0.22.2 is first used.
+
+    This does not call a market provider and therefore consumes no SoldComps request.
+    It only freezes the currently known card values/holdings so later additions and
+    removals can be separated from genuine market-price movement.
+    """
+    try:
+        existing=db.list_collection_market_snapshots(limit=20000)
+    except Exception:
+        existing=[]
+    positioned=[p for p in existing if isinstance((p.get("metadata") or {}).get("positions"),dict) and (p.get("metadata") or {}).get("positions")]
+    if positioned:
+        return {"status":"already_initialized","snapshot_id":positioned[-1].get("id"),"positioned_snapshots":len(positioned)}
+    sid=_record_collection_market_snapshot('performance_baseline')
+    if not sid:
+        return {"status":"not_available","snapshot_id":None,"message":"Noch kein vollständig bewertbarer Sammlungswert vorhanden."}
+    return {"status":"created","snapshot_id":sid,"message":"Performance-Basis gespeichert; künftige Zugänge/Abgänge werden getrennt von Marktbewegungen ausgewiesen."}
 
 @app.post("/api/v1/collection/market/refresh")
 def refresh_collection_market():
