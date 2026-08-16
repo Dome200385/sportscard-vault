@@ -11,6 +11,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, FileResponse, Response
+from PIL import Image, ImageOps
 from .config import settings
 from . import db
 from .schemas import CardCreateRequest, ManualCompIn, ScanResponse, ConfirmScanRequest, AutoConfirmScanRequest, ValuationOut, CardIdentityIn, OwnedInstanceIn
@@ -25,7 +26,7 @@ STATIC_INDEX = Path(__file__).resolve().parent.parent / "static" / "index.html"
 
 logger = logging.getLogger("sportscard-vault")
 
-app = FastAPI(title="SportsCard Vault API", version="0.22.3.1", description="Detailed sports-card collection API with editable scan review, correction learning data, transparent comp-based valuation, and an offline-first test UI.")
+app = FastAPI(title="SportsCard Vault API", version="0.22.4", description="Detailed sports-card collection API with editable scan review, correction learning data, transparent comp-based valuation, and an offline-first test UI.")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=False, allow_methods=["*"], allow_headers=["*"])
 
 from contextlib import asynccontextmanager
@@ -49,7 +50,7 @@ async def lifespan(app: FastAPI):
 app.router.lifespan_context = lifespan
 
 @app.get("/health")
-def health(): return {"status":"ok","version":"0.22.3.1","environment":settings.app_env,"recognition":settings.recognition_provider,"pricing_provider":settings.price_provider,"database_provider":settings.database_provider}
+def health(): return {"status":"ok","version":"0.22.4","environment":settings.app_env,"recognition":settings.recognition_provider,"pricing_provider":settings.price_provider,"database_provider":settings.database_provider}
 
 
 def _serve_test_ui():
@@ -236,9 +237,12 @@ def image_blob_metadata(image_id: str):
         raise HTTPException(500, detail=f"Image metadata read failed: {type(exc).__name__}")
 
 @app.get("/api/v1/images/{image_id}", include_in_schema=True)
-def image_blob(image_id: str):
-    """Serve an image persisted in Postgres fallback storage."""
-    # Accept a copied pgimg:// reference as well as the bare UUID.
+def image_blob(image_id: str, w: int | None = Query(None, ge=96, le=1600)):
+    """Serve a persisted image; optionally return a lightweight thumbnail.
+
+    Collection cards use ``?w=480`` so phones do not download multi-megabyte
+    originals just to draw a small tile. Card detail still uses the original.
+    """
     image_id = (image_id or "").strip()
     if image_id.startswith("pgimg://"):
         image_id = image_id.split("://", 1)[1]
@@ -250,10 +254,29 @@ def image_blob(image_id: str):
         raise HTTPException(500, detail=f"Image read failed: {type(exc).__name__}")
     if not row:
         raise HTTPException(404, "Image not found")
+    raw = bytes(row["data"])
+    media_type = row.get("content_type") or "application/octet-stream"
+    if w:
+        try:
+            source = Image.open(io.BytesIO(raw))
+            source = ImageOps.exif_transpose(source)
+            source.thumbnail((w, int(w * 1.5)), Image.Resampling.LANCZOS)
+            if source.mode not in ("RGB", "L"):
+                source = source.convert("RGB")
+            out = io.BytesIO()
+            source.save(out, format="JPEG", quality=80, optimize=True)
+            raw = out.getvalue()
+            media_type = "image/jpeg"
+        except Exception:
+            logger.warning("thumbnail generation failed for %s; serving original", image_id, exc_info=True)
     return Response(
-        content=bytes(row["data"]),
-        media_type=row.get("content_type") or "application/octet-stream",
-        headers={"Cache-Control": "private, max-age=3600", "X-Image-Storage": "postgres"},
+        content=raw,
+        media_type=media_type,
+        headers={
+            "Cache-Control": "private, max-age=86400" if w else "private, max-age=3600",
+            "X-Image-Storage": "postgres",
+            "X-Image-Variant": f"thumb-{w}" if w else "original",
+        },
     )
 
 @app.get("/api/v1/collection/summary")
@@ -285,6 +308,40 @@ def create_manual_card(payload: CardCreateRequest):
 @app.get("/api/v1/collection")
 def collection(q: str | None=None, sport: str | None=None, page: int=Query(1,ge=1), page_size: int=Query(50,ge=1,le=200)):
     return db.list_collection(q=q,sport=sport,page=page,page_size=page_size)
+
+@app.get("/api/v1/collection/feed")
+def collection_feed(q: str | None=None, page: int=Query(1,ge=1), page_size: int=Query(12,ge=1,le=48)):
+    """Compact paged collection feed for the UI.
+
+    V0.22.4 removes the browser-side N+1 pattern where opening the collection
+    requested /cards/{id} once for every card before anything could render.
+    This endpoint returns only the fields required for tiles in one request.
+    """
+    listing = db.list_collection(q=q, page=page, page_size=page_size)
+    base_items = listing.get("items", []) if isinstance(listing, dict) else []
+
+    def compact(item: dict) -> dict:
+        cid = item.get("id") or item.get("card_identity_id")
+        card = db.get_card(cid) if cid else None
+        identity = (card or {}).get("identity") or item
+        instances = (card or {}).get("instances") or []
+        first = instances[0] if instances else {}
+        return {
+            **identity,
+            "id": cid or identity.get("id"),
+            "instance_count": len(instances) or int(item.get("owned_quantity") or 1),
+            "front_image_url": signed_url(first.get("front_image_path")) if first.get("front_image_path") else None,
+            "back_image_url": signed_url(first.get("back_image_path")) if first.get("back_image_path") else None,
+        }
+
+    if len(base_items) > 1:
+        workers = min(6, len(base_items))
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            items = list(pool.map(compact, base_items))
+    else:
+        items = [compact(x) for x in base_items]
+    total = listing.get("total") if isinstance(listing, dict) else len(items)
+    return {"items": items, "page": page, "page_size": page_size, "total": total, "has_more": page * page_size < int(total or 0)}
 
 @app.get("/api/v1/cards/{card_id}")
 def card_detail(card_id: str):
@@ -673,11 +730,18 @@ def collection_market_summary():
         if page > 100: break
     valued=0; total=0.0; currencies=set(); missing=0; comp_count=0; cards={}
     current_by_card={}; base7_by_card={}; base30_by_card={}; latest_dates=[]
-    for item in items:
-        cid=item.get("id") or item.get("card_identity_id")
-        if not cid: continue
-        try: state=_card_market_state(cid,history_limit=365)
-        except KeyError: continue
+    card_ids=[item.get("id") or item.get("card_identity_id") for item in items]
+    card_ids=[cid for cid in card_ids if cid]
+    def _load_market(cid):
+        try: return cid,_card_market_state(cid,history_limit=365)
+        except KeyError: return cid,None
+    if len(card_ids)>1:
+        with ThreadPoolExecutor(max_workers=min(8,len(card_ids))) as pool:
+            loaded=list(pool.map(_load_market,card_ids))
+    else:
+        loaded=[_load_market(cid) for cid in card_ids]
+    for cid,state in loaded:
+        if not state: continue
         cards[cid]={k:state[k] for k in ['current_value','currency','source','confidence','last_updated','change_7d_pct','change_30d_pct','included_comp_count','reliable']}
         cards[cid]['history_points']=len(state['history']); cards[cid]['history']=[{k:p.get(k) for k in ('value','currency','recorded_at')} for p in state['history'][-90:]]
         comp_count += state['included_comp_count']
@@ -859,10 +923,15 @@ def collection_market_history(limit_per_card: int = Query(5000,ge=1,le=10000)):
         if len(batch)<200 or page>=100: break
         page+=1
     histories={}
-    for item in listing:
-        cid=item.get("id") or item.get("card_identity_id")
-        if cid:
-            histories[cid]=db.list_market_snapshots(cid,limit=limit_per_card)
+    history_ids=[item.get("id") or item.get("card_identity_id") for item in listing]
+    history_ids=[cid for cid in history_ids if cid]
+    def _load_history(cid):
+        return cid,db.list_market_snapshots(cid,limit=limit_per_card)
+    if len(history_ids)>1:
+        with ThreadPoolExecutor(max_workers=min(8,len(history_ids))) as pool:
+            histories=dict(pool.map(_load_history,history_ids))
+    else:
+        histories=dict(_load_history(cid) for cid in history_ids)
     moments=sorted({str(p.get("recorded_at")) for h in histories.values() for p in h if p.get("recorded_at") and p.get("value") is not None})
     legacy=[]; latest={}; cursors={cid:0 for cid in histories}
     for moment in moments:
