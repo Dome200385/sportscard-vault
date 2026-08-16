@@ -295,7 +295,7 @@ def add_market_snapshot(card_id: str, snapshot: dict) -> str:
 
 
 def list_market_snapshots(card_id: str, limit: int = 365) -> list[dict]:
-    limit=min(max(int(limit or 365),1),2000)
+    limit=min(max(int(limit or 365),1),10000)
     with connect() as con, con.cursor() as cur:
         cur.execute(
             "select id,value,currency,source,confidence,snapshot_type,comp_count,metadata_json,recorded_at "
@@ -494,3 +494,16 @@ def image_blob_ready() -> tuple[bool, str | None]:
                     con.commit()
             except Exception:
                 pass
+
+def delete_card_instance(instance_id: str) -> dict:
+    with connect() as con, con.cursor() as cur:
+        cur.execute("select card_identity_id from public.card_instances where id=%s limit 1",(instance_id,)); row=cur.fetchone()
+        if not row: raise KeyError(instance_id)
+        card_id=str(row['card_identity_id'])
+        cur.execute("delete from public.card_instances where id=%s",(instance_id,))
+        cur.execute("select count(*) as n from public.card_instances where card_identity_id=%s",(card_id,)); remaining=int(cur.fetchone()['n'])
+        identity_deleted=False
+        if remaining == 0:
+            cur.execute("delete from public.card_identities where id=%s",(card_id,)); identity_deleted=True
+        con.commit()
+    return {"instance_id":instance_id,"card_id":card_id,"remaining_instances":remaining,"identity_deleted":identity_deleted}

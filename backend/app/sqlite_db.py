@@ -203,7 +203,7 @@ def add_market_snapshot(card_id: str, snapshot: dict) -> str:
     return sid
 
 def list_market_snapshots(card_id: str, limit: int = 365) -> list[dict]:
-    limit=min(max(int(limit or 365),1),2000)
+    limit=min(max(int(limit or 365),1),10000)
     with connect() as con:
         rows=con.execute("SELECT * FROM market_price_snapshots WHERE card_identity_id=? ORDER BY recorded_at ASC LIMIT ?",(card_id,limit)).fetchall()
     out=[]
@@ -305,3 +305,16 @@ def export_rows() -> list[dict]:
     for r in rows:
         d=json.loads(r["identity_json"]); d.update({f"owned_{k}":v for k,v in json.loads(r["instance_json"]).items()}); d["card_identity_id"]=r["identity_id"]; d["instance_id"]=r["instance_id"]; out.append(d)
     return out
+
+def delete_card_instance(instance_id: str) -> dict:
+    with connect() as con:
+        row=con.execute("SELECT card_identity_id FROM card_instances WHERE id=?",(instance_id,)).fetchone()
+        if not row: raise KeyError(instance_id)
+        card_id=row[0]
+        con.execute("DELETE FROM card_instances WHERE id=?",(instance_id,))
+        remaining=con.execute("SELECT count(*) FROM card_instances WHERE card_identity_id=?",(card_id,)).fetchone()[0]
+        identity_deleted=False
+        if remaining == 0:
+            con.execute("DELETE FROM card_identities WHERE id=?",(card_id,))
+            identity_deleted=True
+    return {"instance_id":instance_id,"card_id":card_id,"remaining_instances":remaining,"identity_deleted":identity_deleted}

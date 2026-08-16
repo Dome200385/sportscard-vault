@@ -188,7 +188,7 @@ def add_market_snapshot(card_id: str, snapshot: dict) -> str:
     return sid
 
 def list_market_snapshots(card_id: str, limit: int = 365) -> list[dict]:
-    limit=min(max(int(limit or 365),1),2000)
+    limit=min(max(int(limit or 365),1),10000)
     rows=client().table("market_price_snapshots").select("*").eq("card_identity_id",card_id).order("recorded_at").limit(limit).execute().data or []
     out=[]
     for r in rows:
@@ -330,3 +330,15 @@ def export_rows() -> list[dict]:
             d["instance_id"] = inst["id"]
             out.append(d)
     return out
+
+def delete_card_instance(instance_id: str) -> dict:
+    sb=client()
+    row=_single_data(sb.table("card_instances").select("id,card_identity_id").eq("id",instance_id).limit(1).execute())
+    if not row: raise KeyError(instance_id)
+    card_id=str(row["card_identity_id"])
+    sb.table("card_instances").delete().eq("id",instance_id).execute()
+    left=sb.table("card_instances").select("id",count="exact").eq("card_identity_id",card_id).limit(1).execute()
+    remaining=int(left.count or 0); identity_deleted=False
+    if remaining == 0:
+        sb.table("card_identities").delete().eq("id",card_id).execute(); identity_deleted=True
+    return {"instance_id":instance_id,"card_id":card_id,"remaining_instances":remaining,"identity_deleted":identity_deleted}

@@ -25,7 +25,7 @@ STATIC_INDEX = Path(__file__).resolve().parent.parent / "static" / "index.html"
 
 logger = logging.getLogger("sportscard-vault")
 
-app = FastAPI(title="SportsCard Vault API", version="0.20.1", description="Detailed sports-card collection API with editable scan review, correction learning data, transparent comp-based valuation, and an offline-first test UI.")
+app = FastAPI(title="SportsCard Vault API", version="0.21.0", description="Detailed sports-card collection API with editable scan review, correction learning data, transparent comp-based valuation, and an offline-first test UI.")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=False, allow_methods=["*"], allow_headers=["*"])
 
 from contextlib import asynccontextmanager
@@ -49,7 +49,7 @@ async def lifespan(app: FastAPI):
 app.router.lifespan_context = lifespan
 
 @app.get("/health")
-def health(): return {"status":"ok","version":"0.20.0","environment":settings.app_env,"recognition":settings.recognition_provider,"pricing_provider":settings.price_provider,"database_provider":settings.database_provider}
+def health(): return {"status":"ok","version":"0.21.0","environment":settings.app_env,"recognition":settings.recognition_provider,"pricing_provider":settings.price_provider,"database_provider":settings.database_provider}
 
 
 def _serve_test_ui():
@@ -444,7 +444,7 @@ def _baseline_value(history: list[dict], days: int) -> float | None:
     return eligible[-1][1]
 
 
-def _card_market_state(card_id: str, history_limit: int = 365) -> dict:
+def _card_market_state(card_id: str, history_limit: int = 5000) -> dict:
     card=db.get_card(card_id)
     if not card: raise KeyError(card_id)
     comps=card.get('comps') or []
@@ -482,9 +482,11 @@ def _record_current_market_snapshot(card_id: str, source: str = 'verified_comps'
     if state['current_value'] is None: return None
     history=state['history']
     latest=history[-1] if history else None
-    # Avoid duplicate snapshots when the value/source did not actually change within the same update cycle.
+    # Keep a durable time series without creating dozens of identical points on the same day.
     if latest and latest.get('value') is not None and abs(float(latest['value'])-float(state['current_value'])) < 0.005 and (latest.get('source') or '')==source:
-        return latest.get('id')
+        latest_dt=_parse_dt(latest.get('recorded_at'))
+        if latest_dt and latest_dt.date()==datetime.now(timezone.utc).date():
+            return latest.get('id')
     return db.add_market_snapshot(card_id,{
         'value':state['current_value'],'currency':state['currency'] or 'USD','source':source,
         'confidence':state['confidence'],'snapshot_type':'verified_comps' if source=='verified_comps' else 'provider_estimate',
@@ -524,7 +526,7 @@ def card_market(card_id: str):
     }
 
 @app.get("/api/v1/cards/{card_id}/market-history")
-def card_market_history(card_id: str, limit: int = Query(365,ge=1,le=2000)):
+def card_market_history(card_id: str, limit: int = Query(5000,ge=1,le=10000)):
     try: state=_card_market_state(card_id,history_limit=limit)
     except KeyError: raise HTTPException(404,"Card not found")
     return {k:state[k] for k in ['card_id','current_value','currency','source','confidence','last_updated','change_7d_pct','change_30d_pct','history']}
@@ -598,7 +600,7 @@ def _ingest_soldcomps_search(card_id: str, card: dict, search: dict) -> dict:
             if item_id: existing_ids.add(item_id)
         except Exception as exc:
             logger.warning("Could not persist SoldComps item %s for card %s: %s", item_id, card_id, exc)
-    snapshot_id=_record_current_market_snapshot(card_id,'verified_comps') if added else None
+    snapshot_id=_record_current_market_snapshot(card_id,'verified_comps')
     current=_card_market_state(card_id)
     return {
         'query':normalized.get('query'),'raw_results':normalized.get('raw_count',0),
@@ -776,6 +778,45 @@ def refresh_collection_market():
         'providers':provider_status(),'errors':errors,'details':details,
         'message':f'SoldComps: {requests_used} API-Abfragen parallel verarbeitet, {new_comps} neue Vergleichsverkäufe gespeichert, {cards_updated} Karten aktualisiert.'
     }
+
+
+@app.delete("/api/v1/card-instances/{instance_id}")
+def delete_card_instance(instance_id: str):
+    """Delete one owned physical card. If it was the last instance, its identity and cascaded market data are removed too."""
+    try:
+        result=db.delete_card_instance(instance_id)
+    except KeyError:
+        raise HTTPException(404,"Card instance not found")
+    return {"status":"deleted",**result}
+
+@app.get("/api/v1/collection/market-history")
+def collection_market_history(limit_per_card: int = Query(5000,ge=1,le=10000)):
+    listing=[]; page=1
+    while True:
+        batch=db.list_collection(page=page,page_size=200).get("items",[])
+        listing.extend(batch)
+        if len(batch)<200 or page>=100: break
+        page+=1
+    histories={}
+    for item in listing:
+        cid=item.get("id") or item.get("card_identity_id")
+        if cid:
+            histories[cid]=db.list_market_snapshots(cid,limit=limit_per_card)
+    moments=sorted({str(p.get("recorded_at")) for h in histories.values() for p in h if p.get("recorded_at") and p.get("value") is not None})
+    points=[]; latest={}
+    cursors={cid:0 for cid in histories}
+    for moment in moments:
+        for cid,h in histories.items():
+            idx=cursors[cid]
+            while idx < len(h) and str(h[idx].get("recorded_at")) <= moment:
+                if h[idx].get("value") is not None: latest[cid]=h[idx]
+                idx+=1
+            cursors[cid]=idx
+        vals=[float(v["value"]) for v in latest.values() if v.get("value") is not None]
+        currencies={v.get("currency") for v in latest.values() if v.get("currency")}
+        if vals:
+            points.append({"recorded_at":moment,"value":round(sum(vals),2),"currency":next(iter(currencies)) if len(currencies)==1 else "MIXED","valued_cards":len(vals)})
+    return {"history":points,"points":len(points),"cards":len(histories)}
 
 @app.get("/api/v1/export/csv")
 def export_csv():
