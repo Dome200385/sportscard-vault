@@ -720,12 +720,12 @@ def market_match_preview(payload: dict):
 
 @app.get("/api/v1/collection/market-summary")
 def collection_market_summary():
-    """Reliable persisted market summary for the deferred collection dashboard.
+    """Fast persisted market summary for the deferred collection dashboard.
 
-    V0.22.4.2 deliberately reuses the already proven per-card market-state
-    calculation. It is deferred by the browser, so it never blocks the first
-    collection paint and it never contacts SoldComps. Sequential reads avoid
-    backend/client concurrency edge cases seen in V0.22.4/4.1.
+    V0.22.4.4 intentionally does *not* read per-card price history here.
+    Opening the collection only needs each card's already stored comps/current
+    value. Historical snapshots are loaded separately by /collection/market-history.
+    No provider/SoldComps request is made.
     """
     items=[]; page=1; page_size=200
     while True:
@@ -744,21 +744,54 @@ def collection_market_summary():
     cards={}; valued=0; total=0.0; missing=0; comp_count=0; currencies=set(); latest_dates=[]
     for cid in card_ids:
         try:
-            # Proven V0.22.3.x calculation path. History is kept modest here;
-            # the full portfolio chart is loaded by /collection/market-history.
-            state=_card_market_state(cid,history_limit=400)
-            cards[cid]=state
-            comp_count += int(state.get("included_comp_count") or 0)
-            if state.get("last_updated"): latest_dates.append(state["last_updated"])
-            if state.get("current_value") is None:
+            card=db.get_card(cid)
+            if not card:
                 missing += 1
                 continue
-            valued += 1
-            total += float(state["current_value"])
-            if state.get("currency"): currencies.add(state["currency"])
-        except Exception as exc:
+            comps=card.get("comps") or []
+            usable=[c for c in comps if c.get("included_in_valuation",True) and c.get("price") is not None]
+            values=[float(c["price"]) for c in usable]
+            current=_median(values)
+            currency=next((c.get("currency") for c in usable if c.get("currency")),None)
+            source="verified_comps" if current is not None else None
+            confidence=min(1.0,len(usable)/max(1,settings.min_reliable_comps)) if current is not None else None
+            sold_dates=[_parse_dt(c.get("sold_at") or c.get("created_at")) for c in usable]
+            sold_dates=[d for d in sold_dates if d]
+            last_updated=max(sold_dates).isoformat() if sold_dates else None
+
+            # Provider-only values are uncommon in this installation, but preserve
+            # them without loading the full history: request only the latest point.
+            if current is None:
+                try:
+                    hist=db.list_market_snapshots(cid,limit=1)
+                except Exception:
+                    hist=[]
+                latest=hist[-1] if hist else None
+                if latest and latest.get("value") is not None:
+                    current=float(latest["value"]); currency=latest.get("currency")
+                    source=latest.get("source") or latest.get("snapshot_type") or "provider"
+                    confidence=latest.get("confidence")
+                    last_updated=latest.get("recorded_at")
+
+            state={
+                "card_id":cid,"current_value":current,"currency":currency,"source":source,
+                "confidence":confidence,"last_updated":last_updated,
+                "change_7d_pct":None,"change_30d_pct":None,"history":[],
+                "comp_count":len(comps),"included_comp_count":len(usable),
+                "low":min(values) if values else None,"high":max(values) if values else None,
+                "reliable":len(usable)>=settings.min_reliable_comps,
+            }
+            cards[cid]=state
+            comp_count += len(usable)
+            if last_updated: latest_dates.append(last_updated)
+            if current is None:
+                missing += 1
+                continue
+            valued += 1; total += float(current)
+            if currency: currencies.add(currency)
+        except Exception:
             missing += 1
-            logger.exception("Deferred market state failed for %s",cid)
+            logger.exception("Deferred lightweight market state failed for %s",cid)
 
     currency=next(iter(currencies)) if len(currencies)==1 else ("MIXED" if currencies else None)
     considered=len(items)
@@ -768,7 +801,7 @@ def collection_market_summary():
         "estimated_collection_value":round(total,2) if valued else None,"currency":currency,
         "change_7d_pct":None,"change_30d_pct":None,
         "last_market_update":max(latest_dates) if latest_dates else None,"cards":cards,
-        "method":"deferred_proven_card_market_state_no_provider_calls",
+        "method":"lightweight_persisted_comps_no_history_no_provider_calls",
         "status":"valued" if valued else "waiting_for_comps"
     }
 
