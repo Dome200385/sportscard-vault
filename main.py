@@ -6,6 +6,8 @@ import asyncio
 import logging
 from pathlib import Path
 from uuid import uuid4
+from datetime import datetime, timezone, timedelta
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, FileResponse, Response
@@ -17,12 +19,13 @@ from .recognition import analyze_images
 from .catalog import rank_catalog
 from .image_storage import persist_image, signed_url, storage_ready, storage_diagnostics
 from . import postgres_probe
+from .market_providers import (build_fingerprint, provider_status, score_candidate, soldcomps_search, normalize_soldcomps_results, SoldCompsError)
 
 STATIC_INDEX = Path(__file__).resolve().parent.parent / "static" / "index.html"
 
 logger = logging.getLogger("sportscard-vault")
 
-app = FastAPI(title="SportsCard Vault API", version="0.15.13", description="Detailed sports-card collection API with editable scan review, correction learning data, transparent comp-based valuation, and an offline-first test UI.")
+app = FastAPI(title="SportsCard Vault API", version="0.22.0", description="Detailed sports-card collection API with editable scan review, correction learning data, transparent comp-based valuation, and an offline-first test UI.")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=False, allow_methods=["*"], allow_headers=["*"])
 
 from contextlib import asynccontextmanager
@@ -46,14 +49,25 @@ async def lifespan(app: FastAPI):
 app.router.lifespan_context = lifespan
 
 @app.get("/health")
-def health(): return {"status":"ok","version":"0.15.13","environment":settings.app_env,"recognition":settings.recognition_provider,"pricing_provider":settings.price_provider,"database_provider":settings.database_provider}
+def health(): return {"status":"ok","version":"0.22.0","environment":settings.app_env,"recognition":settings.recognition_provider,"pricing_provider":settings.price_provider,"database_provider":settings.database_provider}
 
 
-@app.get("/", include_in_schema=False)
-def test_ui():
+def _serve_test_ui():
     if STATIC_INDEX.exists():
         return FileResponse(STATIC_INDEX)
     return {"name":"SportsCard Vault","status":"ok"}
+
+@app.get("/", include_in_schema=False)
+def test_ui():
+    return _serve_test_ui()
+
+@app.get("/scan", include_in_schema=False)
+def scan_ui():
+    return _serve_test_ui()
+
+@app.get("/app", include_in_schema=False)
+def app_ui():
+    return _serve_test_ui()
 
 @app.get("/api/v1/system/preflight")
 def system_preflight():
@@ -202,9 +216,23 @@ def persistence_check():
     checks["errors"] = list(dict.fromkeys(errors))
     return checks
 
+@app.get("/api/v1/images/{image_id}/meta", include_in_schema=True)
+def image_blob_metadata(image_id: str):
+    """Safe metadata-only check for a Postgres image blob."""
+    try:
+        from .postgres_db import image_blob_meta
+        return image_blob_meta(image_id)
+    except Exception as exc:
+        logger.exception("image blob metadata read failed")
+        raise HTTPException(500, detail=f"Image metadata read failed: {type(exc).__name__}")
+
 @app.get("/api/v1/images/{image_id}", include_in_schema=True)
 def image_blob(image_id: str):
     """Serve an image persisted in Postgres fallback storage."""
+    # Accept a copied pgimg:// reference as well as the bare UUID.
+    image_id = (image_id or "").strip()
+    if image_id.startswith("pgimg://"):
+        image_id = image_id.split("://", 1)[1]
     try:
         from .postgres_db import get_image_blob
         row = get_image_blob(image_id)
@@ -216,7 +244,7 @@ def image_blob(image_id: str):
     return Response(
         content=bytes(row["data"]),
         media_type=row.get("content_type") or "application/octet-stream",
-        headers={"Cache-Control": "private, max-age=3600"},
+        headers={"Cache-Control": "private, max-age=3600", "X-Image-Storage": "postgres"},
     )
 
 @app.get("/api/v1/collection/summary")
@@ -381,11 +409,97 @@ def scan_detail(scan_id: str):
 def correction_stats():
     return db.correction_stats()
 
+
+def _median(values: list[float]) -> float | None:
+    vals=sorted(float(v) for v in values)
+    if not vals: return None
+    n=len(vals)
+    return vals[n//2] if n%2 else (vals[n//2-1]+vals[n//2])/2
+
+
+def _parse_dt(value):
+    if value is None: return None
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+    try:
+        return datetime.fromisoformat(str(value).replace('Z','+00:00'))
+    except Exception:
+        return None
+
+
+def _pct_change(current: float | None, baseline: float | None) -> float | None:
+    if current is None or baseline in (None,0): return None
+    return round((float(current)-float(baseline))/float(baseline)*100,2)
+
+
+def _baseline_value(history: list[dict], days: int) -> float | None:
+    cutoff=datetime.now(timezone.utc)-timedelta(days=days)
+    eligible=[]
+    for point in history:
+        dt=_parse_dt(point.get('recorded_at'))
+        if dt and dt <= cutoff and point.get('value') is not None:
+            eligible.append((dt,float(point['value'])))
+    if not eligible: return None
+    eligible.sort(key=lambda x:x[0])
+    return eligible[-1][1]
+
+
+def _card_market_state(card_id: str, history_limit: int = 5000) -> dict:
+    card=db.get_card(card_id)
+    if not card: raise KeyError(card_id)
+    comps=card.get('comps') or []
+    usable=[c for c in comps if c.get('included_in_valuation',True) and c.get('price') is not None]
+    comp_values=[float(c['price']) for c in usable]
+    comp_median=_median(comp_values)
+    comp_currency=next((c.get('currency') for c in usable if c.get('currency')),None)
+    history=db.list_market_snapshots(card_id,limit=history_limit)
+    latest=history[-1] if history else None
+    # Verified sold comps take precedence; otherwise a licensed provider estimate may drive the current value.
+    if comp_median is not None:
+        current=float(comp_median); currency=comp_currency
+        source='verified_comps'; confidence=min(1.0,len(usable)/max(1,settings.min_reliable_comps))
+        last_updated=max((_parse_dt(c.get('sold_at') or c.get('created_at')) for c in usable),default=None,key=lambda x:x or datetime.min.replace(tzinfo=timezone.utc))
+        if not last_updated and latest: last_updated=_parse_dt(latest.get('recorded_at'))
+    elif latest and latest.get('value') is not None:
+        current=float(latest['value']); currency=latest.get('currency')
+        source=latest.get('source') or latest.get('snapshot_type') or 'provider'; confidence=latest.get('confidence')
+        last_updated=_parse_dt(latest.get('recorded_at'))
+    else:
+        current=None; currency=None; source=None; confidence=None; last_updated=None
+    return {
+        'card_id':card_id,'current_value':current,'currency':currency,'source':source,'confidence':confidence,
+        'last_updated':last_updated.isoformat() if last_updated else None,
+        'change_7d_pct':_pct_change(current,_baseline_value(history,7)),
+        'change_30d_pct':_pct_change(current,_baseline_value(history,30)),
+        'history':history,'comp_count':len(comps),'included_comp_count':len(usable),
+        'low':min(comp_values) if comp_values else None,'high':max(comp_values) if comp_values else None,
+        'reliable':len(usable)>=settings.min_reliable_comps,
+    }
+
+
+def _record_current_market_snapshot(card_id: str, source: str = 'verified_comps') -> str | None:
+    state=_card_market_state(card_id)
+    if state['current_value'] is None: return None
+    history=state['history']
+    latest=history[-1] if history else None
+    # Keep a durable time series without creating dozens of identical points on the same day.
+    if latest and latest.get('value') is not None and abs(float(latest['value'])-float(state['current_value'])) < 0.005 and (latest.get('source') or '')==source:
+        latest_dt=_parse_dt(latest.get('recorded_at'))
+        if latest_dt and latest_dt.date()==datetime.now(timezone.utc).date():
+            return latest.get('id')
+    return db.add_market_snapshot(card_id,{
+        'value':state['current_value'],'currency':state['currency'] or 'USD','source':source,
+        'confidence':state['confidence'],'snapshot_type':'verified_comps' if source=='verified_comps' else 'provider_estimate',
+        'comp_count':state['included_comp_count'],'metadata':{'method':'market_state_snapshot'}
+    })
+
 @app.post("/api/v1/cards/{card_id}/comps/manual")
 def manual_comp(card_id: str, payload: ManualCompIn):
-    try: cid=db.add_comp(card_id,payload.model_dump(mode="json"))
+    try:
+        cid=db.add_comp(card_id,payload.model_dump(mode="json"))
+        snapshot_id=_record_current_market_snapshot(card_id,"verified_comps")
     except KeyError: raise HTTPException(404,"Card not found")
-    return {"comp_id":cid}
+    return {"comp_id":cid,"market_snapshot_id":snapshot_id}
 
 @app.get("/api/v1/cards/{card_id}/valuation", response_model=ValuationOut)
 def valuation(card_id: str):
@@ -394,6 +508,347 @@ def valuation(card_id: str):
     comps=[Comp(float(c["price"]),c["currency"],c.get("raw_or_graded","raw"),c.get("included_in_valuation",True)) for c in card["comps"]]
     result=calculate_valuation(comps,settings.min_reliable_comps)
     return ValuationOut(**result.__dict__)
+
+
+@app.get("/api/v1/cards/{card_id}/market")
+def card_market(card_id: str):
+    try: state=_card_market_state(card_id)
+    except KeyError: raise HTTPException(404,"Card not found")
+    card=db.get_card(card_id) or {}
+    return {
+        "card_id":card_id,"comp_count":state['comp_count'],"included_comp_count":state['included_comp_count'],
+        "median":state['current_value'] if state['source']=='verified_comps' else None,
+        "current_value":state['current_value'],"low":state['low'],"high":state['high'],
+        "currency":state['currency'],"reliable":state['reliable'],"confidence":state['confidence'],
+        "source":state['source'],"last_updated":state['last_updated'],
+        "change_7d_pct":state['change_7d_pct'],"change_30d_pct":state['change_30d_pct'],
+        "min_reliable_comps":settings.min_reliable_comps,"history":state['history'],"comps":card.get('comps') or []
+    }
+
+@app.get("/api/v1/cards/{card_id}/market-history")
+def card_market_history(card_id: str, limit: int = Query(5000,ge=1,le=10000)):
+    try: state=_card_market_state(card_id,history_limit=limit)
+    except KeyError: raise HTTPException(404,"Card not found")
+    return {k:state[k] for k in ['card_id','current_value','currency','source','confidence','last_updated','change_7d_pct','change_30d_pct','history']}
+
+
+
+@app.get("/api/v1/market/providers")
+def market_provider_status():
+    return {
+        "providers": provider_status(),
+        "automatic_provider_configured": bool(settings.soldcomps_api_key),
+        "policy": "Only completed sold listings are used as automatic comps. Asking prices and AI-invented prices are excluded.",
+    }
+
+@app.get("/api/v1/cards/{card_id}/market-fingerprint")
+def card_market_fingerprint(card_id: str):
+    card=db.get_card(card_id)
+    if not card: raise HTTPException(404,"Card not found")
+    fp=build_fingerprint(card)
+    return {
+        "card_id": card_id,
+        "fingerprint": fp.as_dict(),
+        "matching_threshold": 0.72,
+        "hard_identity_fields": ["subject","card_number","parallel_name","raw_or_graded"],
+    }
+
+
+def _ingest_soldcomps_search(card_id: str, card: dict, search: dict) -> dict:
+    fp=build_fingerprint(card)
+    normalized=normalize_soldcomps_results(fp, search)
+    existing_ids={str(c.get('source_item_id')) for c in (card.get('comps') or []) if c.get('source_item_id')}
+    added=0; included=0; excluded=0
+    for row in normalized.get('matches') or []:
+        item=row['item']; item_id=str(item.get('itemId') or '')
+        if item_id and item_id in existing_ids:
+            continue
+        comp={
+            'source':'soldcomps_ebay',
+            'source_item_id':item_id or None,
+            'source_url':item.get('url'),
+            'sale_type':item.get('buyingFormat') or 'sold',
+            'sold_at':item.get('endedAt'),
+            # Use all-in transaction cost when SoldComps supplies it; this keeps
+            # shipping treatment consistent across comps.
+            'price':row.get('all_in_price'),
+            'currency':row.get('currency') or 'USD',
+            'shipping_price':item.get('shippingPrice'),
+            'all_in_price':row.get('all_in_price'),
+            'raw_or_graded':fp.raw_or_graded or 'raw',
+            'grading_company':fp.grading_company,
+            'grade_numeric':fp.grade_numeric,
+            'title_raw':item.get('title'),
+            'matched_identity_confidence':row['match'].get('score'),
+            'included_in_valuation':bool(row.get('included_in_valuation')),
+            'exclusion_reason':row.get('exclusion_reason'),
+            'provider_metadata':{
+                'thumbnail_url':item.get('thumbnailUrl'),
+                'full_res_thumbnail_url':item.get('fullResThumbnailUrl'),
+                'condition':item.get('condition'),
+                'best_offer_accepted':item.get('bestOfferAccepted'),
+                'seller_feedback_score':item.get('sellerFeedbackScore'),
+                'match_evidence':row['match'].get('evidence'),
+                'query':normalized.get('query'),
+            },
+        }
+        try:
+            db.add_comp(card_id,comp)
+            added += 1
+            if comp['included_in_valuation']: included += 1
+            else: excluded += 1
+            if item_id: existing_ids.add(item_id)
+        except Exception as exc:
+            logger.warning("Could not persist SoldComps item %s for card %s: %s", item_id, card_id, exc)
+    snapshot_id=_record_current_market_snapshot(card_id,'verified_comps')
+    current=_card_market_state(card_id)
+    return {
+        'query':normalized.get('query'),'raw_results':normalized.get('raw_count',0),
+        'identity_matches':normalized.get('matched_count',0),'included_matches':normalized.get('included_count',0),
+        'rejected_count':normalized.get('rejected_count',0),'new_comps':added,
+        'new_included_comps':included,'new_excluded_outliers':excluded,'snapshot_id':snapshot_id,
+        'rejected_preview':normalized.get('rejected_preview',[]),
+        'current_market':{k:current[k] for k in ['current_value','currency','source','confidence','last_updated','change_7d_pct','change_30d_pct','included_comp_count','reliable']},
+    }
+
+
+@app.post("/api/v1/cards/{card_id}/market/refresh")
+def refresh_card_market(card_id: str):
+    card=db.get_card(card_id)
+    if not card: raise HTTPException(404,"Card not found")
+    fp=build_fingerprint(card)
+    if not settings.soldcomps_api_key:
+        state=_card_market_state(card_id)
+        return {
+            "card_id": card_id,"status": "provider_not_configured","fingerprint": fp.as_dict(),
+            "providers": provider_status(),"new_verified_comps": 0,"new_provider_estimates": 0,
+            "current_market": {k:state[k] for k in ['current_value','currency','source','confidence','last_updated','change_7d_pct','change_30d_pct']},
+            "message": "SoldComps ist noch nicht konfiguriert. Es wurden keine Preise erfunden oder aus aktiven Angeboten abgeleitet.",
+        }
+    try:
+        search=soldcomps_search(fp)
+        result=_ingest_soldcomps_search(card_id,card,search)
+    except SoldCompsError as exc:
+        status='quota_exceeded' if exc.code=='quota_exceeded' else 'provider_error'
+        return {
+            'card_id':card_id,'status':status,'fingerprint':fp.as_dict(),'providers':provider_status(),
+            'new_verified_comps':0,'new_provider_estimates':0,
+            'provider_http_status':exc.status_code,'provider_error_code':exc.code,
+            'message':str(exc),
+        }
+    return {
+        'card_id':card_id,'status':'updated','fingerprint':fp.as_dict(),'providers':provider_status(),
+        'new_verified_comps':result['new_comps'],'new_provider_estimates':0,'soldcomps':result,
+        'message':f"SoldComps geprüft: {result['raw_results']} Verkäufe, {result['identity_matches']} Identitäts-Matches, {result['new_comps']} neue Comps gespeichert.",
+    }
+
+@app.post("/api/v1/market/match-preview")
+def market_match_preview(payload: dict):
+    card_id=payload.get("card_id")
+    candidate=payload.get("candidate") or {}
+    if not card_id: raise HTTPException(422,"card_id required")
+    card=db.get_card(card_id)
+    if not card: raise HTTPException(404,"Card not found")
+    fp=build_fingerprint(card)
+    return {"card_id":card_id,"fingerprint":fp.as_dict(),"match":score_candidate(fp,candidate)}
+
+@app.get("/api/v1/collection/market-summary")
+def collection_market_summary():
+    items=[]; page=1; page_size=200
+    while True:
+        listing=db.list_collection(page=page,page_size=page_size)
+        batch=listing.get("items",[]) if isinstance(listing,dict) else []
+        items.extend(batch)
+        if len(batch) < page_size: break
+        page += 1
+        if page > 100: break
+    valued=0; total=0.0; currencies=set(); missing=0; comp_count=0; cards={}
+    current_by_card={}; base7_by_card={}; base30_by_card={}; latest_dates=[]
+    for item in items:
+        cid=item.get("id") or item.get("card_identity_id")
+        if not cid: continue
+        try: state=_card_market_state(cid,history_limit=365)
+        except KeyError: continue
+        cards[cid]={k:state[k] for k in ['current_value','currency','source','confidence','last_updated','change_7d_pct','change_30d_pct','included_comp_count','reliable']}
+        cards[cid]['history_points']=len(state['history']); cards[cid]['history']=[{k:p.get(k) for k in ('value','currency','recorded_at')} for p in state['history'][-90:]]
+        comp_count += state['included_comp_count']
+        if state['last_updated']: latest_dates.append(state['last_updated'])
+        if state['current_value'] is None:
+            missing += 1; continue
+        current=float(state['current_value']); total += current; valued += 1
+        if state['currency']: currencies.add(state['currency'])
+        current_by_card[cid]=current
+        base7=_baseline_value(state['history'],7); base30=_baseline_value(state['history'],30)
+        if base7 is not None: base7_by_card[cid]=base7
+        if base30 is not None: base30_by_card[cid]=base30
+    currency=next(iter(currencies)) if len(currencies)==1 else ("MIXED" if currencies else None)
+    considered=len(items)
+    base7_total=sum(base7_by_card.values()) if base7_by_card and set(current_by_card).issubset(set(base7_by_card)) else None
+    base30_total=sum(base30_by_card.values()) if base30_by_card and set(current_by_card).issubset(set(base30_by_card)) else None
+    return {
+        "cards_considered":considered,"valued_cards":valued,"cards_without_comps":missing,
+        "included_comp_count":comp_count,"coverage_pct":round((valued/considered*100),1) if considered else 0.0,
+        "estimated_collection_value":round(total,2) if valued else None,"currency":currency,
+        "change_7d_pct":_pct_change(total,base7_total),"change_30d_pct":_pct_change(total,base30_total),
+        "last_market_update":max(latest_dates) if latest_dates else None,"cards":cards,
+        "method":"sum_of_current_verified_comp_medians_or_provider_snapshots","status":"valued" if valued else "waiting_for_comps"
+    }
+
+def _record_collection_market_snapshot(reason: str = "market_refresh") -> str | None:
+    summary=collection_market_summary()
+    value=summary.get("estimated_collection_value")
+    currency=summary.get("currency")
+    if value is None or not currency or currency == "MIXED":
+        return None
+    try:
+        return db.add_collection_market_snapshot({
+            "value":value,"currency":currency,"valued_cards":summary.get("valued_cards") or 0,
+            "total_cards":summary.get("cards_considered") or 0,"included_comp_count":summary.get("included_comp_count") or 0,
+            "metadata":{"reason":reason,"coverage_pct":summary.get("coverage_pct") or 0}
+        })
+    except Exception:
+        return None
+
+@app.post("/api/v1/collection/market/refresh")
+def refresh_collection_market():
+    items=[]; page=1
+    while True:
+        listing=db.list_collection(page=page,page_size=200); batch=listing.get('items',[])
+        items.extend(batch)
+        if len(batch)<200 or page>=100: break
+        page+=1
+    if not settings.soldcomps_api_key:
+        return {
+            'status':'provider_not_configured','cards_checked':len(items),'cards_updated':0,
+            'providers':provider_status(),
+            'message':'SoldComps ist nicht konfiguriert; bestehende verifizierte Comps und Preis-Historie bleiben unverändert.'
+        }
+
+    # V0.20.1: SoldComps scrape calls can each take many seconds. Running one
+    # request after another made a collection refresh exceed the browser/proxy
+    # request window and the UI only showed "Failed to fetch". Group by the
+    # exact SoldComps query (so duplicates still consume only one API credit)
+    # and fetch the unique queries concurrently. Database ingestion remains
+    # sequential afterwards.
+    groups: dict[str, list[tuple[str, dict]]] = {}
+    details=[]
+    for item in items:
+        cid=item.get('id') or item.get('card_identity_id')
+        if not cid: continue
+        card=db.get_card(cid)
+        if not card: continue
+        fp=build_fingerprint(card); query=fp.soldcomps_query().strip()
+        if not query:
+            details.append({'card_id':cid,'status':'insufficient_fingerprint'}); continue
+        groups.setdefault(query, []).append((cid, card))
+
+    search_cache: dict[str, dict] = {}
+    search_errors: dict[str, dict] = {}
+    unique_queries=list(groups.keys())
+    requests_used=len(unique_queries)
+    max_workers=max(1, min(6, len(unique_queries)))
+
+    def _search(query: str):
+        cid, card = groups[query][0]
+        fp=build_fingerprint(card)
+        return soldcomps_search(fp)
+
+    if unique_queries:
+        with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix='soldcomps') as pool:
+            futures={pool.submit(_search, q): q for q in unique_queries}
+            for fut in as_completed(futures):
+                query=futures[fut]
+                try:
+                    search_cache[query]=fut.result()
+                except SoldCompsError as exc:
+                    search_errors[query]={'http_status':exc.status_code,'code':exc.code,'message':str(exc)}
+                except Exception as exc:
+                    search_errors[query]={'message':f'{type(exc).__name__}: {exc}'}
+
+    cards_updated=0; new_comps=0; errors=[]
+    for query, card_rows in groups.items():
+        if query in search_errors:
+            err=search_errors[query]
+            for cid, _card in card_rows:
+                errors.append({'card_id':cid,'query':query,**err})
+            continue
+        provider_result=search_cache.get(query)
+        if not provider_result:
+            for cid, _card in card_rows:
+                errors.append({'card_id':cid,'query':query,'message':'Provider returned no usable response'})
+            continue
+        for cid, card in card_rows:
+            try:
+                result=_ingest_soldcomps_search(cid,card,provider_result)
+                if result['new_comps']>0: cards_updated += 1
+                new_comps += result['new_comps']
+                details.append({'card_id':cid,'status':'updated',**{k:result[k] for k in ['query','raw_results','identity_matches','new_comps','new_included_comps']}})
+            except Exception as exc:
+                errors.append({'card_id':cid,'query':query,'message':f'{type(exc).__name__}: {exc}'})
+
+    collection_snapshot_id=_record_collection_market_snapshot('market_refresh')
+    return {
+        'status':'updated' if not errors else ('partial' if new_comps or cards_updated else 'provider_error'),
+        'cards_checked':len(items),'cards_updated':cards_updated,'new_verified_comps':new_comps,
+        'provider_requests_used':requests_used,'unique_queries':len(unique_queries),'parallel_workers':max_workers,
+        'providers':provider_status(),'errors':errors,'details':details,'collection_snapshot_id':collection_snapshot_id,
+        'message':f'SoldComps: {requests_used} API-Abfragen parallel verarbeitet, {new_comps} neue Vergleichsverkäufe gespeichert, {cards_updated} Karten aktualisiert.'
+    }
+
+
+@app.delete("/api/v1/card-instances/{instance_id}")
+def delete_card_instance(instance_id: str):
+    """Delete one owned physical card. If it was the last instance, its identity and cascaded market data are removed too."""
+    try:
+        result=db.delete_card_instance(instance_id)
+    except KeyError:
+        raise HTTPException(404,"Card instance not found")
+    snapshot_id=_record_collection_market_snapshot('manual_delete')
+    return {"status":"deleted","collection_snapshot_id":snapshot_id,**result}
+
+@app.get("/api/v1/collection/market-history")
+def collection_market_history(limit_per_card: int = Query(5000,ge=1,le=10000)):
+    # V0.22: portfolio snapshots are immutable and survive later manual card deletion.
+    # For installations upgraded from V0.21 we also build a legacy aggregate from
+    # card histories so already collected historical data remains visible.
+    durable=[]
+    try:
+        durable=db.list_collection_market_snapshots(limit=20000)
+    except Exception:
+        durable=[]
+
+    listing=[]; page=1
+    while True:
+        batch=db.list_collection(page=page,page_size=200).get("items",[])
+        listing.extend(batch)
+        if len(batch)<200 or page>=100: break
+        page+=1
+    histories={}
+    for item in listing:
+        cid=item.get("id") or item.get("card_identity_id")
+        if cid:
+            histories[cid]=db.list_market_snapshots(cid,limit=limit_per_card)
+    moments=sorted({str(p.get("recorded_at")) for h in histories.values() for p in h if p.get("recorded_at") and p.get("value") is not None})
+    legacy=[]; latest={}; cursors={cid:0 for cid in histories}
+    for moment in moments:
+        for cid,h in histories.items():
+            idx=cursors[cid]
+            while idx < len(h) and str(h[idx].get("recorded_at")) <= moment:
+                if h[idx].get("value") is not None: latest[cid]=h[idx]
+                idx+=1
+            cursors[cid]=idx
+        vals=[float(v["value"]) for v in latest.values() if v.get("value") is not None]
+        currencies={v.get("currency") for v in latest.values() if v.get("currency")}
+        if vals:
+            legacy.append({"recorded_at":moment,"value":round(sum(vals),2),"currency":next(iter(currencies)) if len(currencies)==1 else "MIXED","valued_cards":len(vals),"source":"legacy_card_aggregate"})
+
+    # Merge by timestamp; durable snapshots take precedence for the same moment.
+    merged={str(p.get('recorded_at')):p for p in legacy if p.get('recorded_at')}
+    for p in durable:
+        if p.get('recorded_at'):
+            merged[str(p.get('recorded_at'))]={**p,"source":"portfolio_snapshot"}
+    points=sorted(merged.values(), key=lambda p:str(p.get('recorded_at')))
+    return {"history":points,"points":len(points),"cards":len(histories),"durable_points":len(durable),"method":"durable_portfolio_snapshots_plus_legacy_backfill"}
 
 @app.get("/api/v1/export/csv")
 def export_csv():

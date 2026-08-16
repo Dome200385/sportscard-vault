@@ -36,6 +36,17 @@ CREATE TABLE IF NOT EXISTS market_comps (
   data_json TEXT NOT NULL,
   created_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS market_price_snapshots (
+  id TEXT PRIMARY KEY,
+  card_identity_id TEXT NOT NULL REFERENCES card_identities(id) ON DELETE CASCADE,
+  data_json TEXT NOT NULL,
+  recorded_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS collection_market_snapshots (
+  id TEXT PRIMARY KEY,
+  data_json TEXT NOT NULL,
+  recorded_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS scan_events (
   id TEXT PRIMARY KEY,
   front_image_path TEXT,
@@ -59,6 +70,8 @@ CREATE TABLE IF NOT EXISTS scan_corrections (
 CREATE INDEX IF NOT EXISTS idx_identity_search ON card_identities(sport, season, primary_subject_name, card_number_normalized);
 CREATE INDEX IF NOT EXISTS idx_instances_identity ON card_instances(card_identity_id);
 CREATE INDEX IF NOT EXISTS idx_comps_identity ON market_comps(card_identity_id);
+CREATE INDEX IF NOT EXISTS idx_market_snapshots_card_time ON market_price_snapshots(card_identity_id, recorded_at);
+CREATE INDEX IF NOT EXISTS idx_collection_market_snapshots_time ON collection_market_snapshots(recorded_at);
 CREATE INDEX IF NOT EXISTS idx_scan_created ON scan_events(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_scan_corrections_scan ON scan_corrections(scan_id);
 """
@@ -187,6 +200,39 @@ def add_comp(card_id: str, comp: dict) -> str:
         con.execute("INSERT INTO market_comps VALUES (?,?,?,?)",(cid,card_id,json.dumps(comp,ensure_ascii=False,default=str),now_iso()))
     return cid
 
+
+def add_market_snapshot(card_id: str, snapshot: dict) -> str:
+    sid=str(uuid4()); row=dict(snapshot); recorded=row.pop('recorded_at',None) or now_iso()
+    with connect() as con:
+        if not con.execute("SELECT 1 FROM card_identities WHERE id=?",(card_id,)).fetchone(): raise KeyError(card_id)
+        con.execute("INSERT INTO market_price_snapshots VALUES (?,?,?,?)",(sid,card_id,json.dumps(row,ensure_ascii=False,default=str),recorded))
+    return sid
+
+def list_market_snapshots(card_id: str, limit: int = 365) -> list[dict]:
+    limit=min(max(int(limit or 365),1),10000)
+    with connect() as con:
+        rows=con.execute("SELECT * FROM market_price_snapshots WHERE card_identity_id=? ORDER BY recorded_at ASC LIMIT ?",(card_id,limit)).fetchall()
+    out=[]
+    for r in rows:
+        d=json.loads(r['data_json']); d['id']=r['id']; d['recorded_at']=r['recorded_at']; out.append(d)
+    return out
+
+
+def add_collection_market_snapshot(snapshot: dict) -> str:
+    sid=str(uuid4()); row=dict(snapshot); recorded=row.pop('recorded_at',None) or now_iso()
+    with connect() as con:
+        con.execute("INSERT INTO collection_market_snapshots VALUES (?,?,?)",(sid,json.dumps(row,ensure_ascii=False,default=str),recorded))
+    return sid
+
+def list_collection_market_snapshots(limit: int = 10000) -> list[dict]:
+    limit=min(max(int(limit or 10000),1),20000)
+    with connect() as con:
+        rows=con.execute("SELECT * FROM collection_market_snapshots ORDER BY recorded_at ASC LIMIT ?",(limit,)).fetchall()
+    out=[]
+    for r in rows:
+        d=json.loads(r['data_json']); d['id']=r['id']; d['recorded_at']=r['recorded_at']; out.append(d)
+    return out
+
 def save_scan(front: str, back: str | None, locked_context: dict, output: dict, scan_id: str | None = None) -> str:
     sid=scan_id or str(uuid4())
     with connect() as con:
@@ -281,3 +327,16 @@ def export_rows() -> list[dict]:
     for r in rows:
         d=json.loads(r["identity_json"]); d.update({f"owned_{k}":v for k,v in json.loads(r["instance_json"]).items()}); d["card_identity_id"]=r["identity_id"]; d["instance_id"]=r["instance_id"]; out.append(d)
     return out
+
+def delete_card_instance(instance_id: str) -> dict:
+    with connect() as con:
+        row=con.execute("SELECT card_identity_id FROM card_instances WHERE id=?",(instance_id,)).fetchone()
+        if not row: raise KeyError(instance_id)
+        card_id=row[0]
+        con.execute("DELETE FROM card_instances WHERE id=?",(instance_id,))
+        remaining=con.execute("SELECT count(*) FROM card_instances WHERE card_identity_id=?",(card_id,)).fetchone()[0]
+        identity_deleted=False
+        if remaining == 0:
+            con.execute("DELETE FROM card_identities WHERE id=?",(card_id,))
+            identity_deleted=True
+    return {"instance_id":instance_id,"card_id":card_id,"remaining_instances":remaining,"identity_deleted":identity_deleted}

@@ -179,6 +179,36 @@ def add_comp(card_id: str, comp: dict) -> str:
     return cid
 
 
+
+def add_market_snapshot(card_id: str, snapshot: dict) -> str:
+    sb=client()
+    if not _single_data(sb.table("card_identities").select("id").eq("id",card_id).limit(1).execute()): raise KeyError(card_id)
+    sid=str(uuid4()); payload=dict(snapshot); recorded=payload.pop('recorded_at',None) or now_iso()
+    sb.table("market_price_snapshots").insert({"id":sid,"card_identity_id":card_id,"data_json":payload,"recorded_at":recorded}).execute()
+    return sid
+
+def list_market_snapshots(card_id: str, limit: int = 365) -> list[dict]:
+    limit=min(max(int(limit or 365),1),10000)
+    rows=client().table("market_price_snapshots").select("*").eq("card_identity_id",card_id).order("recorded_at").limit(limit).execute().data or []
+    out=[]
+    for r in rows:
+        d=dict(r.get('data_json') or {}); d['id']=r['id']; d['recorded_at']=r['recorded_at']; out.append(d)
+    return out
+
+
+def add_collection_market_snapshot(snapshot: dict) -> str:
+    sid=str(uuid4()); payload=dict(snapshot); recorded=payload.pop('recorded_at',None) or now_iso()
+    client().table("collection_market_snapshots").insert({"id":sid,"data_json":payload,"recorded_at":recorded}).execute()
+    return sid
+
+def list_collection_market_snapshots(limit: int = 10000) -> list[dict]:
+    limit=min(max(int(limit or 10000),1),20000)
+    rows=client().table("collection_market_snapshots").select("*").order("recorded_at").limit(limit).execute().data or []
+    out=[]
+    for r in rows:
+        d=dict(r.get('data_json') or {}); d['id']=r['id']; d['recorded_at']=r['recorded_at']; out.append(d)
+    return out
+
 def save_scan(front: str, back: str | None, locked_context: dict, output: dict, scan_id: str | None = None) -> str:
     sid = scan_id or str(uuid4())
     client().table("scan_events").insert({
@@ -314,3 +344,15 @@ def export_rows() -> list[dict]:
             d["instance_id"] = inst["id"]
             out.append(d)
     return out
+
+def delete_card_instance(instance_id: str) -> dict:
+    sb=client()
+    row=_single_data(sb.table("card_instances").select("id,card_identity_id").eq("id",instance_id).limit(1).execute())
+    if not row: raise KeyError(instance_id)
+    card_id=str(row["card_identity_id"])
+    sb.table("card_instances").delete().eq("id",instance_id).execute()
+    left=sb.table("card_instances").select("id",count="exact").eq("card_identity_id",card_id).limit(1).execute()
+    remaining=int(left.count or 0); identity_deleted=False
+    if remaining == 0:
+        sb.table("card_identities").delete().eq("id",card_id).execute(); identity_deleted=True
+    return {"instance_id":instance_id,"card_id":card_id,"remaining_instances":remaining,"identity_deleted":identity_deleted}
