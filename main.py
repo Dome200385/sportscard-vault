@@ -8,34 +8,45 @@ from pathlib import Path
 from uuid import uuid4
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse, FileResponse
+from fastapi.responses import StreamingResponse, FileResponse, Response
 from .config import settings
 from . import db
 from .schemas import CardCreateRequest, ManualCompIn, ScanResponse, ConfirmScanRequest, AutoConfirmScanRequest, ValuationOut, CardIdentityIn, OwnedInstanceIn
 from .pricing import Comp, calculate_valuation
 from .recognition import analyze_images
 from .catalog import rank_catalog
-from .image_storage import persist_image, signed_url, storage_ready
+from .image_storage import persist_image, signed_url, storage_ready, storage_diagnostics
+from . import postgres_probe
 
 STATIC_INDEX = Path(__file__).resolve().parent.parent / "static" / "index.html"
 
 logger = logging.getLogger("sportscard-vault")
 
-app = FastAPI(title="SportsCard Vault API", version="0.14.0", description="Detailed sports-card collection API with editable scan review, correction learning data, transparent comp-based valuation, and an offline-first test UI.")
+app = FastAPI(title="SportsCard Vault API", version="0.15.13", description="Detailed sports-card collection API with editable scan review, correction learning data, transparent comp-based valuation, and an offline-first test UI.")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=False, allow_methods=["*"], allow_headers=["*"])
 
 from contextlib import asynccontextmanager
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    db.init_db()
+    # V0.15.2: never crash the whole service just because Supabase is
+    # temporarily unreachable. The DB facade activates an explicit SQLite
+    # diagnostic fallback and exposes the root cause via persistence-check.
+    try:
+        db.init_db()
+    except Exception as exc:
+        logger.exception("database initialization failed; activating diagnostic fallback")
+        try:
+            db.activate_sqlite_fallback(f"Startup DB error: {type(exc).__name__}: {exc}")
+        except Exception:
+            logger.exception("sqlite fallback initialization also failed")
     yield
 
 # Assign lifespan after app construction for compatibility with the existing scaffold.
 app.router.lifespan_context = lifespan
 
 @app.get("/health")
-def health(): return {"status":"ok","version":"0.14.0","environment":settings.app_env,"recognition":settings.recognition_provider,"pricing_provider":settings.price_provider,"database_provider":settings.database_provider}
+def health(): return {"status":"ok","version":"0.15.13","environment":settings.app_env,"recognition":settings.recognition_provider,"pricing_provider":settings.price_provider,"database_provider":settings.database_provider}
 
 
 @app.get("/", include_in_schema=False)
@@ -49,30 +60,164 @@ def system_preflight():
     vision_ready = (settings.recognition_provider or "safe").lower() == "openai" and bool(settings.openai_api_key)
     provider = (settings.database_provider or "sqlite").lower()
     sqlite_ephemeral = provider == "sqlite" and str(settings.database_path).startswith("/tmp/")
-    supabase_persistent = provider == "supabase" and settings.supabase_ready
-    database_persistent = supabase_persistent or (provider == "sqlite" and not sqlite_ephemeral)
+    status = db.provider_status()
+    storage = storage_diagnostics()
+    database_persistent = status.get("active_provider") in {"postgres", "supabase-rest"}
+    image_persistent = bool(storage.get("bucket_exists"))
     notes = []
     if not vision_ready:
         notes.append("Für echte automatische Kartenerkennung OPENAI_API_KEY setzen und RECOGNITION_PROVIDER=openai konfigurieren.")
     if sqlite_ephemeral:
-        notes.append("TESTSPEICHER aktiv: SQLite unter /tmp. V0.14 kann auf Supabase umgeschaltet werden, bevor die Massenerfassung beginnt.")
-    if provider == "supabase" and not settings.supabase_ready:
-        notes.append("Supabase gewählt, aber SUPABASE_URL oder SUPABASE_SECRET_KEY fehlt.")
+        notes.append("TESTSPEICHER aktiv: SQLite unter /tmp.")
+    if status.get("fallback_active"):
+        notes.append("Supabase ist angefordert, aber derzeit nicht erreichbar; SQLite-Diagnosefallback aktiv.")
+    if status.get("provider_error"):
+        notes.append(status["provider_error"])
     return {
         "ready_for_real_scans": vision_ready,
-        "ready_for_mass_collection": vision_ready and database_persistent and storage_ready(),
+        "ready_for_mass_collection": vision_ready and database_persistent and image_persistent,
         "recognition_provider": settings.recognition_provider,
-        "database_provider": settings.database_provider,
+        "database_provider": provider,
+        "database_active_provider": status.get("active_provider"),
+        "database_fallback_active": status.get("fallback_active"),
         "database_path": None if provider == "supabase" else settings.database_path,
         "database_persistent": database_persistent,
-        "image_storage_provider": "supabase" if storage_ready() else "local",
-        "image_storage_persistent": storage_ready(),
+        "image_storage_provider": storage.get("provider") if image_persistent else "local-fallback",
+        "image_storage_persistent": image_persistent,
         "supabase_configured": settings.supabase_ready,
+        "supabase_host": settings.supabase_host,
+        "supabase_dns_ok": status.get("supabase_dns_ok"),
+        "supabase_bucket": settings.supabase_bucket if settings.supabase_ready else None,
         "pricing_provider": settings.price_provider,
         "vision_key_configured": bool(settings.openai_api_key),
         "vision_model": settings.openai_vision_model,
         "notes": notes,
     }
+
+@app.get("/api/v1/system/persistence-check")
+def persistence_check():
+    """Non-destructive production-persistence diagnostics (V0.15.13)."""
+    requested = (settings.database_provider or "sqlite").lower()
+    status = db.provider_status()
+    storage = storage_diagnostics()
+    errors = []
+    if status.get("provider_error"):
+        errors.append(status["provider_error"])
+    if storage.get("error"):
+        errors.append(storage["error"])
+    pg_dns_ok, pg_dns_error = postgres_probe.dns_check()
+    pg_ok, pg_error, pg_info = postgres_probe.connection_check()
+    if pg_dns_error:
+        errors.append(pg_dns_error)
+    if pg_error:
+        errors.append(pg_error)
+    checks = {
+        "database_provider": requested,
+        "database_active_provider": status.get("active_provider"),
+        "database_fallback_active": status.get("fallback_active"),
+        "database_configured": requested == "sqlite" or bool(settings.supabase_database_url) or settings.supabase_ready,
+        "database_persistent": status.get("active_provider") in {"postgres", "supabase-rest"},
+        "database_connection": status.get("active_provider") in {"postgres", "supabase-rest"},
+        "image_storage_persistent": bool(storage.get("bucket_exists")),
+        "supabase_configured": settings.supabase_ready,
+        "supabase_url_normalized": settings.supabase_url,
+        "supabase_host": settings.supabase_host,
+        "supabase_dns_ok": status.get("supabase_dns_ok"),
+        "supabase_dns_error": status.get("supabase_dns_error"),
+        "supabase_bucket": settings.supabase_bucket if settings.supabase_ready else None,
+        "storage_dns_ok": storage.get("dns_ok"),
+        "storage_provider": storage.get("provider"),
+        "storage_sdk": storage.get("sdk"),
+        "storage_postgres_image_fallback_configured": storage.get("postgres_image_fallback_configured"),
+        "storage_postgres_image_fallback_ready": storage.get("postgres_image_fallback_ready"),
+        "storage_postgres_image_fallback_error": storage.get("postgres_image_fallback_error"),
+        "storage_s3_error_preserved": storage.get("s3_error_preserved"),
+        "storage_endpoint_trials": storage.get("endpoint_trials"),
+        "storage_endpoint_trial_any_usable": storage.get("endpoint_trial_any_usable"),
+        "storage_endpoint_trial_winner": storage.get("endpoint_trial_winner"),
+        "storage_rest_split_any_ok": storage.get("rest_split_any_ok"),
+        "storage_s3_split_any_ok": storage.get("s3_split_any_ok"),
+        "storage_rest_split_trial": storage.get("rest_split_trial"),
+        "storage_boto3_request_url": storage.get("boto3_request_url"),
+        "storage_endpoint_path": storage.get("endpoint_path"),
+        "storage_endpoint_path_ok": storage.get("endpoint_path_ok"),
+        "storage_access_key_length": storage.get("access_key_length"),
+        "storage_secret_key_length": storage.get("secret_key_length"),
+        "storage_access_key_has_outer_whitespace": storage.get("access_key_has_outer_whitespace"),
+        "storage_secret_key_has_outer_whitespace": storage.get("secret_key_has_outer_whitespace"),
+        "storage_head_bucket_ok": storage.get("head_bucket_ok"),
+        "storage_head_bucket_status": storage.get("head_bucket_status"),
+        "storage_head_bucket_exception": storage.get("head_bucket_exception"),
+        "storage_head_bucket_error_code": storage.get("head_bucket_s3_error_code"),
+        "storage_head_bucket_error_message": storage.get("head_bucket_s3_error_message"),
+        "storage_head_bucket_http_status": storage.get("head_bucket_s3_http_status"),
+        "storage_project_ref": storage.get("project_ref"),
+        "storage_configured": storage.get("configured"),
+        "storage_endpoint": storage.get("endpoint"),
+        "storage_region": storage.get("region"),
+        "storage_host": storage.get("host"),
+        "storage_dns_ok": storage.get("dns_ok"),
+        "storage_bucket_exists": storage.get("bucket_exists"),
+        "storage_object_access_ok": storage.get("object_access_ok"),
+        "storage_bucket_probe_method": storage.get("bucket_probe_method"),
+        "storage_s3_error_code": storage.get("s3_error_code"),
+        "storage_s3_error_message": storage.get("s3_error_message"),
+        "storage_s3_http_status": storage.get("s3_http_status"),
+        "storage_s3_request_id": storage.get("s3_request_id"),
+        "storage_s3_response_body": storage.get("s3_response_body"),
+        "storage_list_objects_status": storage.get("list_objects_status"),
+        "storage_raw_http_status": storage.get("raw_http_status"),
+        "storage_raw_response_content_type": storage.get("raw_response_content_type"),
+        "storage_raw_response_body": storage.get("raw_response_body"),
+        "storage_raw_request_id": storage.get("raw_request_id"),
+        "storage_write_probe_put_ok": storage.get("write_probe_put_ok"),
+        "storage_write_probe_head_ok": storage.get("write_probe_head_ok"),
+        "storage_write_probe_delete_ok": storage.get("write_probe_delete_ok"),
+        "storage_write_probe_put_status": storage.get("write_probe_put_status"),
+        "storage_write_probe_head_status": storage.get("write_probe_head_status"),
+        "storage_write_probe_delete_status": storage.get("write_probe_delete_status"),
+        "storage_write_probe_error_stage": storage.get("write_probe_error_stage"),
+        "storage_write_probe_exception": storage.get("write_probe_exception"),
+        "storage_bucket_list_visible": storage.get("bucket_list_visible"),
+        "s3_access_key_configured": bool(settings.s3_access_key_id),
+        "s3_secret_key_configured": bool(settings.s3_secret_access_key),
+        "s3_endpoint_candidate": settings.s3_endpoint,
+        "s3_region_candidate": settings.s3_region,
+        "s3_ready": settings.s3_ready,
+        "postgres_url_configured": bool(settings.supabase_database_url),
+        "postgres_host": postgres_probe.host(),
+        "postgres_dns_ok": pg_dns_ok,
+        "postgres_dns_error": pg_dns_error,
+        "postgres_connection_ok": pg_ok,
+        "postgres_connection_error": pg_error,
+        "postgres_info": pg_info,
+    }
+    checks["ready_for_mass_collection"] = bool(
+        checks["database_persistent"]
+        and checks["database_connection"]
+        and checks["image_storage_persistent"]
+        and checks["storage_bucket_exists"]
+        and checks["storage_object_access_ok"]
+    )
+    checks["errors"] = list(dict.fromkeys(errors))
+    return checks
+
+@app.get("/api/v1/images/{image_id}", include_in_schema=True)
+def image_blob(image_id: str):
+    """Serve an image persisted in Postgres fallback storage."""
+    try:
+        from .postgres_db import get_image_blob
+        row = get_image_blob(image_id)
+    except Exception as exc:
+        logger.exception("image blob read failed")
+        raise HTTPException(500, detail=f"Image read failed: {type(exc).__name__}")
+    if not row:
+        raise HTTPException(404, "Image not found")
+    return Response(
+        content=bytes(row["data"]),
+        media_type=row.get("content_type") or "application/octet-stream",
+        headers={"Cache-Control": "private, max-age=3600"},
+    )
 
 @app.get("/api/v1/collection/summary")
 def collection_summary():
