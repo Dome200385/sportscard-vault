@@ -26,7 +26,7 @@ STATIC_INDEX = Path(__file__).resolve().parent.parent / "static" / "index.html"
 
 logger = logging.getLogger("sportscard-vault")
 
-app = FastAPI(title="SportsCard Vault API", version="0.22.4", description="Detailed sports-card collection API with editable scan review, correction learning data, transparent comp-based valuation, and an offline-first test UI.")
+app = FastAPI(title="SportsCard Vault API", version="0.22.4.1", description="Detailed sports-card collection API with editable scan review, correction learning data, transparent comp-based valuation, and an offline-first test UI.")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=False, allow_methods=["*"], allow_headers=["*"])
 
 from contextlib import asynccontextmanager
@@ -720,6 +720,14 @@ def market_match_preview(payload: dict):
 
 @app.get("/api/v1/collection/market-summary")
 def collection_market_summary():
+    """Fast current market summary for the collection UI.
+
+    V0.22.4.1 deliberately avoids loading the complete per-card price history
+    for every card just to paint the collection dashboard. Current values are
+    calculated from already-persisted verified comps. Historical portfolio
+    data is loaded independently by /collection/market-history. This keeps the
+    normal collection load fast and never calls SoldComps.
+    """
     items=[]; page=1; page_size=200
     while True:
         listing=db.list_collection(page=page,page_size=page_size)
@@ -728,44 +736,70 @@ def collection_market_summary():
         if len(batch) < page_size: break
         page += 1
         if page > 100: break
-    valued=0; total=0.0; currencies=set(); missing=0; comp_count=0; cards={}
-    current_by_card={}; base7_by_card={}; base30_by_card={}; latest_dates=[]
+
     card_ids=[item.get("id") or item.get("card_identity_id") for item in items]
     card_ids=[cid for cid in card_ids if cid]
-    def _load_market(cid):
-        try: return cid,_card_market_state(cid,history_limit=365)
-        except KeyError: return cid,None
+
+    def _load_current(cid):
+        try:
+            card=db.get_card(cid)
+            if not card: return cid,None
+            comps=card.get('comps') or []
+            usable=[c for c in comps if c.get('included_in_valuation',True) and c.get('price') is not None]
+            vals=[float(c['price']) for c in usable]
+            current=_median(vals)
+            currency=next((c.get('currency') for c in usable if c.get('currency')),None)
+            last_dt=max((_parse_dt(c.get('sold_at') or c.get('created_at')) for c in usable),default=None,key=lambda x:x or datetime.min.replace(tzinfo=timezone.utc))
+            # Provider-estimate fallback: only touch snapshot history when there
+            # are no verified sold comps for this card.
+            source='verified_comps' if current is not None else None
+            confidence=min(1.0,len(usable)/max(1,settings.min_reliable_comps)) if usable else None
+            if current is None:
+                hist=db.list_market_snapshots(cid,limit=1)
+                latest=hist[-1] if hist else None
+                if latest and latest.get('value') is not None:
+                    current=float(latest['value']); currency=latest.get('currency')
+                    source=latest.get('source') or latest.get('snapshot_type') or 'provider'
+                    confidence=latest.get('confidence'); last_dt=_parse_dt(latest.get('recorded_at'))
+            return cid,{
+                'current_value':current,'currency':currency,'source':source,'confidence':confidence,
+                'last_updated':last_dt.isoformat() if last_dt else None,
+                'change_7d_pct':None,'change_30d_pct':None,
+                'included_comp_count':len(usable),'reliable':len(usable)>=settings.min_reliable_comps,
+                'history_points':0,'history':[]
+            }
+        except Exception as exc:
+            logger.warning('Fast market summary failed for %s: %s',cid,exc)
+            return cid,None
+
     if len(card_ids)>1:
         with ThreadPoolExecutor(max_workers=min(8,len(card_ids))) as pool:
-            loaded=list(pool.map(_load_market,card_ids))
+            loaded=list(pool.map(_load_current,card_ids))
     else:
-        loaded=[_load_market(cid) for cid in card_ids]
+        loaded=[_load_current(cid) for cid in card_ids]
+
+    valued=0; total=0.0; currencies=set(); missing=0; comp_count=0; cards={}; latest_dates=[]
     for cid,state in loaded:
-        if not state: continue
-        cards[cid]={k:state[k] for k in ['current_value','currency','source','confidence','last_updated','change_7d_pct','change_30d_pct','included_comp_count','reliable']}
-        cards[cid]['history_points']=len(state['history']); cards[cid]['history']=[{k:p.get(k) for k in ('value','currency','recorded_at')} for p in state['history'][-90:]]
-        comp_count += state['included_comp_count']
-        if state['last_updated']: latest_dates.append(state['last_updated'])
-        if state['current_value'] is None:
+        if not state: missing += 1; continue
+        cards[cid]=state
+        comp_count += int(state.get('included_comp_count') or 0)
+        if state.get('last_updated'): latest_dates.append(state['last_updated'])
+        if state.get('current_value') is None:
             missing += 1; continue
-        current=float(state['current_value']); total += current; valued += 1
-        if state['currency']: currencies.add(state['currency'])
-        current_by_card[cid]=current
-        base7=_baseline_value(state['history'],7); base30=_baseline_value(state['history'],30)
-        if base7 is not None: base7_by_card[cid]=base7
-        if base30 is not None: base30_by_card[cid]=base30
+        valued += 1; total += float(state['current_value'])
+        if state.get('currency'): currencies.add(state['currency'])
     currency=next(iter(currencies)) if len(currencies)==1 else ("MIXED" if currencies else None)
     considered=len(items)
-    base7_total=sum(base7_by_card.values()) if base7_by_card and set(current_by_card).issubset(set(base7_by_card)) else None
-    base30_total=sum(base30_by_card.values()) if base30_by_card and set(current_by_card).issubset(set(base30_by_card)) else None
     return {
         "cards_considered":considered,"valued_cards":valued,"cards_without_comps":missing,
         "included_comp_count":comp_count,"coverage_pct":round((valued/considered*100),1) if considered else 0.0,
         "estimated_collection_value":round(total,2) if valued else None,"currency":currency,
-        "change_7d_pct":_pct_change(total,base7_total),"change_30d_pct":_pct_change(total,base30_total),
+        "change_7d_pct":None,"change_30d_pct":None,
         "last_market_update":max(latest_dates) if latest_dates else None,"cards":cards,
-        "method":"sum_of_current_verified_comp_medians_or_provider_snapshots","status":"valued" if valued else "waiting_for_comps"
+        "method":"fast_sum_of_persisted_verified_comp_medians_or_provider_snapshots",
+        "status":"valued" if valued else "waiting_for_comps"
     }
+
 
 def _record_collection_market_snapshot(reason: str = "market_refresh") -> str | None:
     summary=collection_market_summary()
