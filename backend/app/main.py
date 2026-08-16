@@ -25,7 +25,7 @@ STATIC_INDEX = Path(__file__).resolve().parent.parent / "static" / "index.html"
 
 logger = logging.getLogger("sportscard-vault")
 
-app = FastAPI(title="SportsCard Vault API", version="0.21.0", description="Detailed sports-card collection API with editable scan review, correction learning data, transparent comp-based valuation, and an offline-first test UI.")
+app = FastAPI(title="SportsCard Vault API", version="0.22.1", description="Detailed sports-card collection API with editable scan review, correction learning data, transparent comp-based valuation, and an offline-first test UI.")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=False, allow_methods=["*"], allow_headers=["*"])
 
 from contextlib import asynccontextmanager
@@ -49,13 +49,22 @@ async def lifespan(app: FastAPI):
 app.router.lifespan_context = lifespan
 
 @app.get("/health")
-def health(): return {"status":"ok","version":"0.21.0","environment":settings.app_env,"recognition":settings.recognition_provider,"pricing_provider":settings.price_provider,"database_provider":settings.database_provider}
+def health(): return {"status":"ok","version":"0.22.1","environment":settings.app_env,"recognition":settings.recognition_provider,"pricing_provider":settings.price_provider,"database_provider":settings.database_provider}
 
 
 def _serve_test_ui():
     if STATIC_INDEX.exists():
-        return FileResponse(STATIC_INDEX)
-    return {"name":"SportsCard Vault","status":"ok"}
+        # V0.22.1: always serve the deployed backend/static dashboard and
+        # prevent browsers/CDNs from holding on to an older UI after deploys.
+        return FileResponse(
+            STATIC_INDEX,
+            headers={
+                "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+                "Pragma": "no-cache",
+                "Expires": "0",
+            },
+        )
+    return {"name":"SportsCard Vault","status":"ok","ui_path":str(STATIC_INDEX)}
 
 @app.get("/", include_in_schema=False)
 def test_ui():
@@ -670,7 +679,7 @@ def collection_market_summary():
         try: state=_card_market_state(cid,history_limit=365)
         except KeyError: continue
         cards[cid]={k:state[k] for k in ['current_value','currency','source','confidence','last_updated','change_7d_pct','change_30d_pct','included_comp_count','reliable']}
-        cards[cid]['history_points']=len(state['history'])
+        cards[cid]['history_points']=len(state['history']); cards[cid]['history']=[{k:p.get(k) for k in ('value','currency','recorded_at')} for p in state['history'][-90:]]
         comp_count += state['included_comp_count']
         if state['last_updated']: latest_dates.append(state['last_updated'])
         if state['current_value'] is None:
@@ -693,6 +702,21 @@ def collection_market_summary():
         "last_market_update":max(latest_dates) if latest_dates else None,"cards":cards,
         "method":"sum_of_current_verified_comp_medians_or_provider_snapshots","status":"valued" if valued else "waiting_for_comps"
     }
+
+def _record_collection_market_snapshot(reason: str = "market_refresh") -> str | None:
+    summary=collection_market_summary()
+    value=summary.get("estimated_collection_value")
+    currency=summary.get("currency")
+    if value is None or not currency or currency == "MIXED":
+        return None
+    try:
+        return db.add_collection_market_snapshot({
+            "value":value,"currency":currency,"valued_cards":summary.get("valued_cards") or 0,
+            "total_cards":summary.get("cards_considered") or 0,"included_comp_count":summary.get("included_comp_count") or 0,
+            "metadata":{"reason":reason,"coverage_pct":summary.get("coverage_pct") or 0}
+        })
+    except Exception:
+        return None
 
 @app.post("/api/v1/collection/market/refresh")
 def refresh_collection_market():
@@ -771,11 +795,12 @@ def refresh_collection_market():
             except Exception as exc:
                 errors.append({'card_id':cid,'query':query,'message':f'{type(exc).__name__}: {exc}'})
 
+    collection_snapshot_id=_record_collection_market_snapshot('market_refresh')
     return {
         'status':'updated' if not errors else ('partial' if new_comps or cards_updated else 'provider_error'),
         'cards_checked':len(items),'cards_updated':cards_updated,'new_verified_comps':new_comps,
         'provider_requests_used':requests_used,'unique_queries':len(unique_queries),'parallel_workers':max_workers,
-        'providers':provider_status(),'errors':errors,'details':details,
+        'providers':provider_status(),'errors':errors,'details':details,'collection_snapshot_id':collection_snapshot_id,
         'message':f'SoldComps: {requests_used} API-Abfragen parallel verarbeitet, {new_comps} neue Vergleichsverkäufe gespeichert, {cards_updated} Karten aktualisiert.'
     }
 
@@ -787,10 +812,20 @@ def delete_card_instance(instance_id: str):
         result=db.delete_card_instance(instance_id)
     except KeyError:
         raise HTTPException(404,"Card instance not found")
-    return {"status":"deleted",**result}
+    snapshot_id=_record_collection_market_snapshot('manual_delete')
+    return {"status":"deleted","collection_snapshot_id":snapshot_id,**result}
 
 @app.get("/api/v1/collection/market-history")
 def collection_market_history(limit_per_card: int = Query(5000,ge=1,le=10000)):
+    # V0.22: portfolio snapshots are immutable and survive later manual card deletion.
+    # For installations upgraded from V0.21 we also build a legacy aggregate from
+    # card histories so already collected historical data remains visible.
+    durable=[]
+    try:
+        durable=db.list_collection_market_snapshots(limit=20000)
+    except Exception:
+        durable=[]
+
     listing=[]; page=1
     while True:
         batch=db.list_collection(page=page,page_size=200).get("items",[])
@@ -803,8 +838,7 @@ def collection_market_history(limit_per_card: int = Query(5000,ge=1,le=10000)):
         if cid:
             histories[cid]=db.list_market_snapshots(cid,limit=limit_per_card)
     moments=sorted({str(p.get("recorded_at")) for h in histories.values() for p in h if p.get("recorded_at") and p.get("value") is not None})
-    points=[]; latest={}
-    cursors={cid:0 for cid in histories}
+    legacy=[]; latest={}; cursors={cid:0 for cid in histories}
     for moment in moments:
         for cid,h in histories.items():
             idx=cursors[cid]
@@ -815,8 +849,15 @@ def collection_market_history(limit_per_card: int = Query(5000,ge=1,le=10000)):
         vals=[float(v["value"]) for v in latest.values() if v.get("value") is not None]
         currencies={v.get("currency") for v in latest.values() if v.get("currency")}
         if vals:
-            points.append({"recorded_at":moment,"value":round(sum(vals),2),"currency":next(iter(currencies)) if len(currencies)==1 else "MIXED","valued_cards":len(vals)})
-    return {"history":points,"points":len(points),"cards":len(histories)}
+            legacy.append({"recorded_at":moment,"value":round(sum(vals),2),"currency":next(iter(currencies)) if len(currencies)==1 else "MIXED","valued_cards":len(vals),"source":"legacy_card_aggregate"})
+
+    # Merge by timestamp; durable snapshots take precedence for the same moment.
+    merged={str(p.get('recorded_at')):p for p in legacy if p.get('recorded_at')}
+    for p in durable:
+        if p.get('recorded_at'):
+            merged[str(p.get('recorded_at'))]={**p,"source":"portfolio_snapshot"}
+    points=sorted(merged.values(), key=lambda p:str(p.get('recorded_at')))
+    return {"history":points,"points":len(points),"cards":len(histories),"durable_points":len(durable),"method":"durable_portfolio_snapshots_plus_legacy_backfill"}
 
 @app.get("/api/v1/export/csv")
 def export_csv():
