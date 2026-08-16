@@ -7,6 +7,7 @@ import logging
 from pathlib import Path
 from uuid import uuid4
 from datetime import datetime, timezone, timedelta
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, FileResponse, Response
@@ -24,7 +25,7 @@ STATIC_INDEX = Path(__file__).resolve().parent.parent / "static" / "index.html"
 
 logger = logging.getLogger("sportscard-vault")
 
-app = FastAPI(title="SportsCard Vault API", version="0.20.0", description="Detailed sports-card collection API with editable scan review, correction learning data, transparent comp-based valuation, and an offline-first test UI.")
+app = FastAPI(title="SportsCard Vault API", version="0.20.1", description="Detailed sports-card collection API with editable scan review, correction learning data, transparent comp-based valuation, and an offline-first test UI.")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=False, allow_methods=["*"], allow_headers=["*"])
 
 from contextlib import asynccontextmanager
@@ -706,10 +707,14 @@ def refresh_collection_market():
             'message':'SoldComps ist nicht konfiguriert; bestehende verifizierte Comps und Preis-Historie bleiben unverändert.'
         }
 
-    # One provider request per unique fingerprint query. Duplicate physical cards
-    # therefore do not burn multiple credits during the same collection refresh.
-    search_cache: dict[str, dict] = {}
-    cards_updated=0; new_comps=0; requests_used=0; errors=[]; details=[]
+    # V0.20.1: SoldComps scrape calls can each take many seconds. Running one
+    # request after another made a collection refresh exceed the browser/proxy
+    # request window and the UI only showed "Failed to fetch". Group by the
+    # exact SoldComps query (so duplicates still consume only one API credit)
+    # and fetch the unique queries concurrently. Database ingestion remains
+    # sequential afterwards.
+    groups: dict[str, list[tuple[str, dict]]] = {}
+    details=[]
     for item in items:
         cid=item.get('id') or item.get('card_identity_id')
         if not cid: continue
@@ -718,23 +723,58 @@ def refresh_collection_market():
         fp=build_fingerprint(card); query=fp.soldcomps_query().strip()
         if not query:
             details.append({'card_id':cid,'status':'insufficient_fingerprint'}); continue
-        try:
-            if query not in search_cache:
-                search_cache[query]=soldcomps_search(fp); requests_used += 1
-            result=_ingest_soldcomps_search(cid,card,search_cache[query])
-            if result['new_comps']>0: cards_updated += 1
-            new_comps += result['new_comps']
-            details.append({'card_id':cid,'status':'updated',**{k:result[k] for k in ['query','raw_results','identity_matches','new_comps','new_included_comps']}})
-        except SoldCompsError as exc:
-            errors.append({'card_id':cid,'query':query,'http_status':exc.status_code,'code':exc.code,'message':str(exc)})
-            if exc.code=='quota_exceeded': break
-        except Exception as exc:
-            errors.append({'card_id':cid,'query':query,'message':f'{type(exc).__name__}: {exc}'})
+        groups.setdefault(query, []).append((cid, card))
+
+    search_cache: dict[str, dict] = {}
+    search_errors: dict[str, dict] = {}
+    unique_queries=list(groups.keys())
+    requests_used=len(unique_queries)
+    max_workers=max(1, min(6, len(unique_queries)))
+
+    def _search(query: str):
+        cid, card = groups[query][0]
+        fp=build_fingerprint(card)
+        return soldcomps_search(fp)
+
+    if unique_queries:
+        with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix='soldcomps') as pool:
+            futures={pool.submit(_search, q): q for q in unique_queries}
+            for fut in as_completed(futures):
+                query=futures[fut]
+                try:
+                    search_cache[query]=fut.result()
+                except SoldCompsError as exc:
+                    search_errors[query]={'http_status':exc.status_code,'code':exc.code,'message':str(exc)}
+                except Exception as exc:
+                    search_errors[query]={'message':f'{type(exc).__name__}: {exc}'}
+
+    cards_updated=0; new_comps=0; errors=[]
+    for query, card_rows in groups.items():
+        if query in search_errors:
+            err=search_errors[query]
+            for cid, _card in card_rows:
+                errors.append({'card_id':cid,'query':query,**err})
+            continue
+        provider_result=search_cache.get(query)
+        if not provider_result:
+            for cid, _card in card_rows:
+                errors.append({'card_id':cid,'query':query,'message':'Provider returned no usable response'})
+            continue
+        for cid, card in card_rows:
+            try:
+                result=_ingest_soldcomps_search(cid,card,provider_result)
+                if result['new_comps']>0: cards_updated += 1
+                new_comps += result['new_comps']
+                details.append({'card_id':cid,'status':'updated',**{k:result[k] for k in ['query','raw_results','identity_matches','new_comps','new_included_comps']}})
+            except Exception as exc:
+                errors.append({'card_id':cid,'query':query,'message':f'{type(exc).__name__}: {exc}'})
+
     return {
         'status':'updated' if not errors else ('partial' if new_comps or cards_updated else 'provider_error'),
         'cards_checked':len(items),'cards_updated':cards_updated,'new_verified_comps':new_comps,
-        'provider_requests_used':requests_used,'providers':provider_status(),'errors':errors,'details':details,
-        'message':f'SoldComps: {requests_used} API-Abfragen, {new_comps} neue Vergleichsverkäufe gespeichert, {cards_updated} Karten aktualisiert.'
+        'provider_requests_used':requests_used,'unique_queries':len(unique_queries),'parallel_workers':max_workers,
+        'providers':provider_status(),'errors':errors,'details':details,
+        'message':f'SoldComps: {requests_used} API-Abfragen parallel verarbeitet, {new_comps} neue Vergleichsverkäufe gespeichert, {cards_updated} Karten aktualisiert.'
     }
 
 @app.get("/api/v1/export/csv")
