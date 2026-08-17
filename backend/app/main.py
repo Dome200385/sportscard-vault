@@ -27,7 +27,7 @@ STATIC_INDEX = Path(__file__).resolve().parent.parent / "static" / "index.html"
 
 logger = logging.getLogger("sportscard-vault")
 
-app = FastAPI(title="SportsCard Vault API", version="0.22.6.0", description="Detailed sports-card collection API with editable scan review, correction learning data, transparent comp-based valuation, and an offline-first test UI.")
+app = FastAPI(title="SportsCard Vault API", version="0.22.6.1", description="Detailed sports-card collection API with editable scan review, correction learning data, transparent comp-based valuation, and an offline-first test UI.")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=False, allow_methods=["*"], allow_headers=["*"])
 
 from contextlib import asynccontextmanager
@@ -57,7 +57,7 @@ async def lifespan(app: FastAPI):
 app.router.lifespan_context = lifespan
 
 @app.get("/health")
-def health(): return {"status":"ok","version":"0.22.6.0","environment":settings.app_env,"recognition":settings.recognition_provider,"pricing_provider":settings.price_provider,"database_provider":settings.database_provider}
+def health(): return {"status":"ok","version":"0.22.6.1","environment":settings.app_env,"recognition":settings.recognition_provider,"pricing_provider":settings.price_provider,"database_provider":settings.database_provider}
 
 
 def _serve_test_ui():
@@ -1168,11 +1168,11 @@ def refresh_collection_market_coverage(max_requests: int = Query(20, ge=1, le=50
 
 @app.get("/api/v1/collection/market/defensive-estimates")
 def defensive_collection_estimates():
-    """Conservative model layer for cards without verified comps.
+    """Card-specific conservative estimates for cards without verified comps.
 
-    This never replaces or persists a verified market value. Estimates are derived
-    only from this collection's already verified comp-based values, with similarity
-    weighting and deliberately conservative discounts.
+    Estimates are display-only. They never replace or persist verified market values.
+    A missing card must have a meaningful same-player or same-product anchor; otherwise
+    it is deliberately left unestimated rather than receiving a collection-wide fallback.
     """
     summary=_compute_collection_market_summary()
     states=summary.get("cards") or {}
@@ -1181,38 +1181,90 @@ def defensive_collection_estimates():
         card=db.get_card(cid) or {}
         row={"card_id":cid,"card":card,"value":state.get("current_value"),"currency":state.get("currency")}
         (valued if state.get("current_value") is not None else missing).append(row)
-    vals=sorted(float(x["value"]) for x in valued if x.get("value") is not None)
-    if not vals:
+    if not valued:
         return {"status":"no_verified_basis","estimates":[],"verified_total":summary.get("estimated_collection_value"),"message":"Keine verifizierte Preisbasis für defensive Modellschätzungen vorhanden."}
+
     def median(a):
-        a=sorted(a); n=len(a); return a[n//2] if n%2 else (a[n//2-1]+a[n//2])/2
-    global_med=median(vals)
-    estimates=[]
+        a=sorted(float(x) for x in a); n=len(a)
+        return a[n//2] if n%2 else (a[n//2-1]+a[n//2])/2
+    def norm(x): return str(x or '').strip().lower()
+    def print_run(c):
+        for key in ('known_print_run','serial_print_run'):
+            try:
+                n=int(c.get(key) or 0)
+                if n>0: return n
+            except (TypeError,ValueError): pass
+        return None
+    def scarcity_factor(n):
+        if not n: return 1.0
+        if n<=1: return 2.00
+        if n<=5: return 1.70
+        if n<=10: return 1.50
+        if n<=25: return 1.32
+        if n<=50: return 1.20
+        if n<=99: return 1.12
+        if n<=199: return 1.06
+        return 1.02
+    def features(c):
+        return {
+            'rookie':bool(c.get('is_rookie')), 'auto':bool(c.get('is_autograph')),
+            'relic':bool(c.get('is_relic')), 'rpa':bool(c.get('is_rpa')),
+            'numbered':bool(c.get('is_serial_numbered')), 'insert':bool(c.get('is_insert')),
+            'short':bool(c.get('is_short_print') or c.get('is_super_short_print') or c.get('is_case_hit')),
+        }
+    def card_multiplier(c):
+        f=features(c); m=1.0
+        if f['rookie']: m*=1.10
+        if f['auto']: m*=1.22
+        if f['relic']: m*=1.10
+        if f['rpa']: m*=1.18
+        if f['insert']: m*=1.04
+        if f['short']: m*=1.12
+        m*=scarcity_factor(print_run(c))
+        return min(m,2.75)
+
+    estimates=[]; unresolved=[]
     for row in missing:
-        c=row["card"]; player=str(c.get("primary_subject_name") or '').strip().lower(); team=str(c.get("team_name") or '').strip().lower(); setn=str(c.get("set_name") or c.get("product_line") or '').strip().lower()
-        peers=[]; tier='collection'; factor=.55
+        c=row['card']; player=norm(c.get('primary_subject_name')); team=norm(c.get('team_name'))
+        product=norm(c.get('product_line')); setn=norm(c.get('set_name')); year=norm(c.get('release_year') or c.get('season'))
+        candidates=[]
         for v in valued:
-            vc=v['card']; score=0
-            if player and str(vc.get('primary_subject_name') or '').strip().lower()==player: score+=5
-            if team and str(vc.get('team_name') or '').strip().lower()==team: score+=1
-            vs=str(vc.get('set_name') or vc.get('product_line') or '').strip().lower()
-            if setn and vs==setn: score+=2
-            if score>=5: peers.append(float(v['value']))
-        if peers: base=median(peers); tier='same_player'; factor=.72 if len(peers)>=2 else .62
-        else: base=global_med
-        # modest rarity modifiers, capped so sparse metadata cannot create extreme prices
-        mod=1.0
-        if c.get('is_rookie'): mod*=1.08
-        if c.get('is_autograph'): mod*=1.12
-        if c.get('is_relic'): mod*=1.05
-        if c.get('is_serial_numbered'): mod*=1.08
-        estimate=max(.5,base*factor*min(1.25,mod))
-        low=max(.5,estimate*.72); high=estimate*1.28
-        confidence='mittel' if tier=='same_player' and len(peers)>=2 else 'niedrig'
-        estimates.append({"card_id":row['card_id'],"estimate":round(estimate,2),"low":round(low,2),"high":round(high,2),"currency":summary.get('currency') or 'USD',"confidence":confidence,"basis":tier,"peer_count":len(peers)})
+            vc=v['card']; vp=norm(vc.get('primary_subject_name')); vproduct=norm(vc.get('product_line')); vset=norm(vc.get('set_name')); vyear=norm(vc.get('release_year') or vc.get('season'))
+            score=0; reasons=[]
+            if player and vp==player: score+=8; reasons.append('same_player')
+            if product and vproduct==product: score+=4; reasons.append('same_product')
+            if setn and vset==setn: score+=3; reasons.append('same_set')
+            if year and vyear==year: score+=2; reasons.append('same_year')
+            if team and norm(vc.get('team_name'))==team: score+=1; reasons.append('same_team')
+            cf,vf=features(c),features(vc)
+            for k in ('rookie','auto','relic','rpa','numbered','insert','short'):
+                if cf[k]==vf[k]: score+=0.6
+            # Require a real semantic anchor: same player OR same product/set.
+            if score>=7 and ('same_player' in reasons or 'same_product' in reasons or 'same_set' in reasons):
+                candidates.append((score,float(v['value']),vc,reasons))
+        candidates.sort(key=lambda x:x[0],reverse=True)
+        peers=candidates[:6]
+        if not peers:
+            unresolved.append(row['card_id']); continue
+        # Weighted median-like anchor: top similarity band, not collection median.
+        top=peers[0][0]; band=[p for p in peers if p[0]>=top-2.5]
+        base=median([p[1] for p in band])
+        # Adjust from peer feature package to target feature package, conservatively capped.
+        peer_mult=median([card_multiplier(p[2]) for p in band])
+        ratio=card_multiplier(c)/max(.5,peer_mult)
+        ratio=max(.55,min(1.65,ratio))
+        # Conservative haircut reflects that this is not an exact sold comp.
+        estimate=max(.50,base*ratio*.82)
+        same_player=sum(1 for p in band if 'same_player' in p[3])
+        confidence='mittel' if same_player>=2 else ('mittel' if len(band)>=3 and top>=10 else 'niedrig')
+        spread=.22 if confidence=='mittel' else .35
+        low=max(.50,estimate*(1-spread)); high=estimate*(1+spread)
+        basis='same_player' if same_player else ('same_product' if any('same_product' in p[3] for p in band) else 'same_set')
+        estimates.append({"card_id":row['card_id'],"estimate":round(estimate,2),"low":round(low,2),"high":round(high,2),"currency":summary.get('currency') or 'USD',"confidence":confidence,"basis":basis,"peer_count":len(band),"anchor_value":round(base,2),"feature_ratio":round(ratio,3)})
+
     est_sum=sum(x['estimate'] for x in estimates); low_sum=sum(x['low'] for x in estimates); high_sum=sum(x['high'] for x in estimates)
     verified=float(summary.get('estimated_collection_value') or 0)
-    return {"status":"estimated","verified_total":round(verified,2),"estimated_missing_mid":round(est_sum,2),"combined_mid":round(verified+est_sum,2),"combined_low":round(verified+low_sum,2),"combined_high":round(verified+high_sum,2),"currency":summary.get('currency') or 'USD',"estimated_cards":len(estimates),"estimates":estimates,"method":"defensive_similarity_model_verified_collection_basis","message":f"Defensive Modellschätzung für {len(estimates)} Karten erstellt. Verifizierte Marktwerte bleiben unverändert."}
+    return {"status":"estimated","verified_total":round(verified,2),"estimated_missing_mid":round(est_sum,2),"combined_mid":round(verified+est_sum,2),"combined_low":round(verified+low_sum,2),"combined_high":round(verified+high_sum,2),"currency":summary.get('currency') or 'USD',"estimated_cards":len(estimates),"unresolved_cards":len(unresolved),"estimates":estimates,"method":"card_specific_defensive_similarity_v2","message":f"Kartenspezifische defensive Schätzung für {len(estimates)} Karten erstellt; {len(unresolved)} Karten ohne belastbare Vergleichsbasis bleiben ungeschätzt. Verifizierte Marktwerte bleiben unverändert."}
 
 @app.post("/api/v1/collection/market/refresh")
 def refresh_collection_market():
