@@ -1232,11 +1232,15 @@ def _persist_defensive_estimates(estimates: dict, estimate_summary: dict, market
 
 @app.api_route("/api/v1/collection/market/defensive-estimates", methods=["GET","POST"])
 def defensive_collection_estimates():
-    """Conservative estimates only when a card has a defensible verified peer basis.
+    """Conservative card-specific estimates for cards without verified comps.
 
-    V0.22.6.6 adds transparent peer diagnostics while preserving the V0.22.6.5 evidence rules: false/absent boolean features no longer
-    create similarity. Text identity, parallel, numbering and positive card traits are
-    weighted; weak peers are rejected instead of falling back to a collection-wide price.
+    V0.22.6.4 uses weighted nearest-neighbour similarity:
+    1) semantic peers (same player/product/set) when available;
+    2) a low-confidence feature proxy anchored to the lower part of the user's VERIFIED
+       collection when exact peers do not exist. This avoids both the old one-price-for-all
+       fallback and the V0.22.6.1 problem where every unresolved card became unestimated.
+
+    Estimates are persisted separately and never become verified market values.
     """
     summary=_compute_collection_market_summary()
     states=summary.get("cards") or {}
@@ -1248,9 +1252,10 @@ def defensive_collection_estimates():
     if not valued:
         return {"status":"no_verified_basis","estimates":[],"verified_total":summary.get("estimated_collection_value"),"message":"Keine verifizierte Preisbasis für defensive Modellschätzungen vorhanden."}
 
-    import re
-    def norm(x): return re.sub(r'[^a-z0-9]+',' ',str(x or '').lower()).strip()
-    def toks(x): return set(norm(x).split())
+    def median(a):
+        a=sorted(float(x) for x in a); n=len(a)
+        return a[n//2] if n%2 else (a[n//2-1]+a[n//2])/2
+    def norm(x): return str(x or '').strip().lower()
     def print_run(c):
         for key in ('known_print_run','serial_print_run'):
             try:
@@ -1259,122 +1264,129 @@ def defensive_collection_estimates():
             except (TypeError,ValueError): pass
         return None
     def scarcity_factor(n):
-        if not n:return 1.0
-        if n<=1:return 2.00
-        if n<=5:return 1.70
-        if n<=10:return 1.50
-        if n<=25:return 1.32
-        if n<=50:return 1.20
-        if n<=99:return 1.12
-        if n<=199:return 1.06
+        if not n: return 1.0
+        if n<=1: return 2.00
+        if n<=5: return 1.70
+        if n<=10: return 1.50
+        if n<=25: return 1.32
+        if n<=50: return 1.20
+        if n<=99: return 1.12
+        if n<=199: return 1.06
         return 1.02
-    POS=('is_rookie','is_autograph','is_relic','is_rpa','is_serial_numbered','is_insert','is_short_print','is_super_short_print','is_case_hit')
+    def features(c):
+        return {
+            'rookie':bool(c.get('is_rookie')), 'auto':bool(c.get('is_autograph')),
+            'relic':bool(c.get('is_relic')), 'rpa':bool(c.get('is_rpa')),
+            'numbered':bool(c.get('is_serial_numbered')), 'insert':bool(c.get('is_insert')),
+            'short':bool(c.get('is_short_print') or c.get('is_super_short_print') or c.get('is_case_hit')),
+        }
     def card_multiplier(c):
-        m=1.0
-        if c.get('is_rookie'):m*=1.10
-        if c.get('is_autograph'):m*=1.22
-        if c.get('is_relic'):m*=1.10
-        if c.get('is_rpa'):m*=1.18
-        if c.get('is_insert'):m*=1.04
-        if c.get('is_short_print') or c.get('is_super_short_print') or c.get('is_case_hit'):m*=1.12
-        sf=scarcity_factor(print_run(c));m*=1.0+(sf-1.0)*.62
+        f=features(c); m=1.0
+        if f['rookie']: m*=1.10
+        if f['auto']: m*=1.22
+        if f['relic']: m*=1.10
+        if f['rpa']: m*=1.18
+        if f['insert']: m*=1.04
+        if f['short']: m*=1.12
+        # Damp scarcity for estimates; exact sold comps would justify a stronger premium.
+        sf=scarcity_factor(print_run(c)); m*=1.0+(sf-1.0)*0.62
         return min(m,2.35)
-    def similarity(a,b):
-        score=0.0; reasons=[]
-        exact=(('primary_subject_name',10,'same_player'),('product_line',5,'same_product'),('set_name',4,'same_set'),
-               ('parallel_name',4,'same_parallel'),('release_year',2,'same_year'),('season',2,'same_season'),
-               ('manufacturer',1.5,'same_manufacturer'),('team_name',1,'same_team'),('sport',1,'same_sport'))
-        for k,w,r in exact:
-            av,bv=norm(a.get(k)),norm(b.get(k))
-            if av and bv and av==bv: score+=w;reasons.append(r)
-        # Partial product/set/parallel overlap helps, but cannot establish a peer by itself.
-        for k,w in (('product_line',1.5),('set_name',1.2),('parallel_name',1.2),('insert_name',1.2)):
-            at,bt=toks(a.get(k)),toks(b.get(k))
-            if at and bt and at!=bt:
-                j=len(at&bt)/len(at|bt)
-                score+=w*j
-        # Critical fix: only PRESENT positive traits add similarity. false==false adds nothing.
-        for k in POS:
-            aa,bb=bool(a.get(k)),bool(b.get(k))
-            if aa and bb: score+=1.15
-            elif aa != bb: score-=0.55
-        ar,br=print_run(a),print_run(b)
-        if ar and br:
-            ratio=max(ar,br)/max(1,min(ar,br))
-            if ratio<=1.25:score+=3;reasons.append('similar_print_run')
-            elif ratio<=2:score+=1.5
-            elif ratio>=5:score-=1
-        # Exact card number is useful only together with product/player context.
-        an,bn=norm(a.get('card_number_normalized') or a.get('card_number_printed')),norm(b.get('card_number_normalized') or b.get('card_number_printed'))
-        if an and bn and an==bn and any(r in reasons for r in ('same_player','same_product','same_set')):
-            score+=2;reasons.append('same_card_number')
-        return score,reasons
 
-    previous,_=_latest_defensive_estimate_payload()
+    verified_values=[float(v['value']) for v in valued if v.get('value') is not None]
+    ordered_values=sorted(verified_values)
+    lower_half=ordered_values[:max(1,(len(ordered_values)+1)//2)]
+    defensive_collection_anchor=median(lower_half)
+    valued_mult_anchor=median([card_multiplier(v['card']) for v in valued]) or 1.0
+
+    previous, _previous_summary = _latest_defensive_estimate_payload()
     fresh=[]; unresolved=[]
     for row in missing:
-        c=row['card']; candidates=[]
+        c=row['card']; player=norm(c.get('primary_subject_name')); team=norm(c.get('team_name'))
+        product=norm(c.get('product_line')); setn=norm(c.get('set_name')); year=norm(c.get('release_year') or c.get('season'))
+        all_candidates=[]
         for v in valued:
-            sc,rs=similarity(c,v['card'])
-            candidates.append((sc,float(v['value']),v['card'],rs,v['card_id']))
-        candidates.sort(key=lambda x:x[0],reverse=True)
-        # A defensible peer needs real semantic identity, not generic shared absence/features.
-        semantic=[p for p in candidates if p[0]>=6.0 and any(r in p[3] for r in ('same_player','same_product','same_set'))]
-        if not semantic:
-            unresolved.append(row['card_id']); continue
-        top=semantic[0][0]
-        band=[p for p in semantic[:8] if p[0]>=max(6.0,top-3.0)]
-        weights=[max(1.0,p[0])**2 for p in band]
-        base=sum(p[1]*w for p,w in zip(band,weights))/sum(weights)
-        peer_mult=sum(card_multiplier(p[2])*w for p,w in zip(band,weights))/sum(weights)
-        ratio=max(.55,min(1.65,card_multiplier(c)/max(.5,peer_mult)))
-        estimate=max(.50,base*ratio*.82)
-        same_player=sum('same_player' in p[3] for p in band)
-        confidence='mittel' if same_player>=2 or (len(band)>=3 and top>=10) else 'niedrig'
-        spread=.24 if confidence=='mittel' else .38
-        cap=max(min(float(max(v['value'] for v in valued))*0.85, base*2.25), 20.0)
+            vc=v['card']; vp=norm(vc.get('primary_subject_name')); vproduct=norm(vc.get('product_line')); vset=norm(vc.get('set_name')); vyear=norm(vc.get('release_year') or vc.get('season'))
+            score=0; reasons=[]
+            if player and vp==player: score+=8; reasons.append('same_player')
+            if product and vproduct==product: score+=4; reasons.append('same_product')
+            if setn and vset==setn: score+=3; reasons.append('same_set')
+            if year and vyear==year: score+=2; reasons.append('same_year')
+            if team and norm(vc.get('team_name'))==team: score+=1; reasons.append('same_team')
+            cf,vf=features(c),features(vc)
+            for k in ('rookie','auto','relic','rpa','numbered','insert','short'):
+                if cf[k]==vf[k]: score+=0.6
+            all_candidates.append((score,float(v['value']),vc,reasons))
+
+        semantic=[p for p in all_candidates if p[0]>=7 and any(r in p[3] for r in ('same_player','same_product','same_set'))]
+        semantic.sort(key=lambda x:x[0],reverse=True)
+        basis=''; confidence='niedrig'; peer_count=0; base=defensive_collection_anchor
+        if semantic:
+            top=semantic[0][0]; band=[p for p in semantic[:8] if p[0]>=top-2.5]
+            # Similarity-weighted value: closest verified cards influence the estimate most.
+            weights=[max(.5,p[0])**2 for p in band]
+            base=sum(p[1]*w for p,w in zip(band,weights))/sum(weights)
+            peer_mult=sum(card_multiplier(p[2])*w for p,w in zip(band,weights))/sum(weights)
+            ratio=max(.55,min(1.65,card_multiplier(c)/max(.5,peer_mult)))
+            estimate=max(.50,base*ratio*.82)
+            same_player=sum(1 for p in band if 'same_player' in p[3])
+            confidence='mittel' if same_player>=2 or (len(band)>=3 and top>=10) else 'niedrig'
+            basis='same_player' if same_player else ('same_product' if any('same_product' in p[3] for p in band) else 'same_set')
+            peer_count=len(band)
+        else:
+            broad=sorted([p for p in all_candidates if p[0]>=2.0], key=lambda x:x[0], reverse=True)[:6]
+            if broad:
+                top=broad[0][0]; band=[p for p in broad if p[0]>=max(2.0,top-2.0)]
+                weights=[max(.5,p[0])**2 for p in band]
+                base=sum(p[1]*w for p,w in zip(band,weights))/sum(weights)
+                peer_mult=sum(card_multiplier(p[2])*w for p,w in zip(band,weights))/sum(weights)
+                ratio=max(.62,min(1.48,card_multiplier(c)/max(.5,peer_mult)))
+                estimate=max(.50,base*ratio*.68)
+                basis='weighted_feature_peers'; peer_count=len(band)
+            else:
+                ratio=max(.62,min(1.55,card_multiplier(c)/max(.5,valued_mult_anchor)))
+                estimate=max(.50,defensive_collection_anchor*ratio*.72)
+                basis='verified_collection_feature_proxy'; peer_count=0
+            confidence='niedrig'
+
+        # Conservative caps prevent a proxy estimate from challenging high-end verified cards.
+        cap=max(defensive_collection_anchor*2.75, 25.0)
+        if print_run(c) and print_run(c)<=25: cap=max(cap,45.0)
         estimate=min(estimate,cap)
-        low=max(.50,estimate*(1-spread));high=estimate*(1+spread)
-        basis='same_player' if same_player else ('same_product' if any('same_product' in p[3] for p in band) else 'same_set')
-        peer_diagnostics=[]
-        for p in candidates[:5]:
-            pc=p[2] or {}
-            peer_diagnostics.append({
-                "card_id":p[4],
-                "player":pc.get('primary_subject_name'),
-                "product_line":pc.get('product_line'),
-                "set_name":pc.get('set_name'),
-                "card_number":pc.get('card_number_printed') or pc.get('card_number_normalized'),
-                "value":round(float(p[1]),2),
-                "score":round(float(p[0]),2),
-                "reasons":list(p[3] or []),
-                "accepted":p in band,
-                "multiplier":round(card_multiplier(pc),3),
-            })
-        fresh.append({"card_id":row['card_id'],"estimate":round(estimate,2),"low":round(low,2),"high":round(high,2),
-            "currency":summary.get('currency') or 'USD',"confidence":confidence,"basis":basis,"peer_count":len(band),
-            "anchor_value":round(base,2),"feature_ratio":round(ratio,3),"similarity_score":round(top,2),
-            "target_multiplier":round(card_multiplier(c),3),"peer_diagnostics":peer_diagnostics,
-            "estimated_at":datetime.now(timezone.utc).isoformat(),"method":"weighted_card_similarity_v6_diagnostic"})
+        spread=.24 if confidence=='mittel' else .42
+        low=max(.50,estimate*(1-spread)); high=estimate*(1+spread)
+        fresh.append({
+            "card_id":row['card_id'],"estimate":round(estimate,2),"low":round(low,2),"high":round(high,2),
+            "currency":summary.get('currency') or 'USD',"confidence":confidence,"basis":basis,
+            "peer_count":peer_count,"anchor_value":round(base,2),
+            "feature_ratio":round(ratio,3),"estimated_at":datetime.now(timezone.utc).isoformat(),
+            "method":"weighted_card_similarity_v4"
+        })
 
     fresh_map={x['card_id']:x for x in fresh}
-    merged={cid:est for cid,est in (previous or {}).items() if isinstance(est,dict) and est.get('method')=='weighted_card_similarity_v6_diagnostic'}
+    merged={cid:est for cid,est in (previous or {}).items() if isinstance(est,dict)}
     merged.update(fresh_map)
+    # Verified prices always win and remove obsolete model values.
     for cid,state in states.items():
-        if state.get('current_value') is not None: merged.pop(cid,None)
-    # Remove stale estimates for cards that no longer meet the v5 evidence threshold.
-    allowed=set(fresh_map)
-    merged={cid:est for cid,est in merged.items() if cid in allowed}
+        if state.get('current_value') is not None:
+            merged.pop(cid,None)
+
     vals=list(merged.values())
-    est_sum=sum(float(x.get('estimate') or 0) for x in vals);low_sum=sum(float(x.get('low') or 0) for x in vals);high_sum=sum(float(x.get('high') or 0) for x in vals)
+    est_sum=sum(float(x.get('estimate') or 0) for x in vals)
+    low_sum=sum(float(x.get('low') or x.get('estimate') or 0) for x in vals)
+    high_sum=sum(float(x.get('high') or x.get('estimate') or 0) for x in vals)
     verified=float(summary.get('estimated_collection_value') or 0)
-    estimate_summary={"status":"estimated" if vals else "insufficient_peer_basis","verified_total":round(verified,2),
-        "estimated_missing_mid":round(est_sum,2),"combined_mid":round(verified+est_sum,2),"combined_low":round(verified+low_sum,2),"combined_high":round(verified+high_sum,2),
-        "currency":summary.get('currency') or 'USD',"estimated_cards":len(vals),"unresolved_cards":len(unresolved),"method":"weighted_card_similarity_v6_diagnostic",
-        "message":f"{len(fresh)} Schätzungen mit Peer-Diagnose berechnet; {len(unresolved)} Karten ohne belastbare Peer-Basis bewusst ungeschätzt."}
-    try:snapshot_id=_persist_defensive_estimates(merged,estimate_summary,summary)
+    estimate_summary={
+        "status":"estimated","verified_total":round(verified,2),"estimated_missing_mid":round(est_sum,2),
+        "combined_mid":round(verified+est_sum,2),"combined_low":round(verified+low_sum,2),"combined_high":round(verified+high_sum,2),
+        "currency":summary.get('currency') or 'USD',"estimated_cards":len(vals),
+        "unresolved_cards":max(0,len(missing)-len(vals)),"method":"weighted_card_similarity_v4",
+        "message":f"{len(fresh)} kartenspezifische defensive Schätzungen berechnet; {len(vals)} defensive Werte persistent gespeichert. Verifizierte Marktwerte bleiben unverändert."
+    }
+    try:
+        snapshot_id=_persist_defensive_estimates(merged,estimate_summary,summary)
     except Exception as exc:
-        logger.exception("defensive estimate persistence failed");raise HTTPException(500,f"Defensive estimate persist failed: {type(exc).__name__}: {exc}")
+        logger.exception("defensive estimate persistence failed")
+        raise HTTPException(500,f"Defensive estimate persist failed: {type(exc).__name__}: {exc}")
     return {**estimate_summary,"estimates":vals,"new_estimates":len(fresh),"snapshot_id":snapshot_id}
 
 @app.post("/api/v1/collection/market/refresh")
