@@ -27,7 +27,7 @@ STATIC_INDEX = Path(__file__).resolve().parent.parent / "static" / "index.html"
 
 logger = logging.getLogger("sportscard-vault")
 
-app = FastAPI(title="SportsCard Vault API", version="0.22.6.2", description="Detailed sports-card collection API with editable scan review, correction learning data, transparent comp-based valuation, and an offline-first test UI.")
+app = FastAPI(title="SportsCard Vault API", version="0.22.6.3", description="Detailed sports-card collection API with editable scan review, correction learning data, transparent comp-based valuation, and an offline-first test UI.")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=False, allow_methods=["*"], allow_headers=["*"])
 
 from contextlib import asynccontextmanager
@@ -934,6 +934,9 @@ def collection_market_cache():
         cached=None
     if cached is not None:
         out=dict(cached)
+        ai_estimates, ai_summary = _latest_defensive_estimate_payload()
+        out["defensive_estimates"]=ai_estimates
+        out["defensive_estimate_summary"]=ai_summary
         out["cache_ready"]=True
         out["status"]="valued" if out.get("estimated_collection_value") is not None else out.get("status","cache_ready")
         out["method"]="instant_persisted_snapshot_cache"
@@ -1005,6 +1008,10 @@ def collection_market_summary():
 
 def _record_collection_market_snapshot(reason: str = "market_refresh") -> str | None:
     summary=_compute_collection_market_summary()
+    prior_ai, prior_ai_summary = _latest_defensive_estimate_payload()
+    for cid,state in (summary.get("cards") or {}).items():
+        if state.get("current_value") is not None:
+            prior_ai.pop(cid,None)
     value=summary.get("estimated_collection_value")
     currency=summary.get("currency")
     if value is None or not currency or currency == "MIXED":
@@ -1021,7 +1028,9 @@ def _record_collection_market_snapshot(reason: str = "market_refresh") -> str | 
                 },
                 # V0.22.4.14: complete precomputed dashboard payload. Normal page loads
                 # read this JSON directly instead of scanning every card and comp.
-                "market_summary_cache":summary
+                "market_summary_cache":summary,
+                "defensive_estimates":prior_ai,
+                "defensive_estimate_summary":prior_ai_summary,
             }
         })
     except Exception:
@@ -1166,13 +1175,72 @@ def refresh_collection_market_coverage(max_requests: int = Query(20, ge=1, le=50
 
 
 
-@app.get("/api/v1/collection/market/defensive-estimates")
-def defensive_collection_estimates():
-    """Card-specific conservative estimates for cards without verified comps.
 
-    Estimates are display-only. They never replace or persist verified market values.
-    A missing card must have a meaningful same-player or same-product anchor; otherwise
-    it is deliberately left unestimated rather than receiving a collection-wide fallback.
+def _latest_defensive_estimate_payload() -> tuple[dict, dict]:
+    """Load the newest persisted defensive estimate bundle from portfolio snapshots."""
+    try:
+        snaps=db.list_collection_market_snapshots(limit=500)
+    except Exception:
+        return {}, {}
+    ordered=sorted(snaps or [], key=lambda x:str(x.get("recorded_at") or ""), reverse=True)
+    for snap in ordered:
+        meta=snap.get("metadata") or {}
+        estimates=meta.get("defensive_estimates")
+        if isinstance(estimates,dict):
+            summary=meta.get("defensive_estimate_summary")
+            return estimates, (summary if isinstance(summary,dict) else {})
+    return {}, {}
+
+
+def _persist_defensive_estimates(estimates: dict, estimate_summary: dict, market_summary: dict) -> str | None:
+    """Persist display-only AI estimates without creating a fake market-history move.
+
+    We reuse collection_market_snapshots as durable JSON storage, but tag the row so the
+    portfolio-history endpoint can ignore it. Verified positions remain the only official
+    market value and performance source.
+    """
+    value=market_summary.get("estimated_collection_value")
+    currency=market_summary.get("currency")
+    if value is None or not currency or currency == "MIXED":
+        return None
+    clean={}
+    cards=market_summary.get("cards") or {}
+    for cid,est in (estimates or {}).items():
+        if not isinstance(est,dict):
+            continue
+        if (cards.get(cid) or {}).get("current_value") is not None:
+            continue
+        clean[cid]=est
+    return db.add_collection_market_snapshot({
+        "value":value,"currency":currency,
+        "valued_cards":market_summary.get("valued_cards") or 0,
+        "total_cards":market_summary.get("cards_considered") or 0,
+        "included_comp_count":market_summary.get("included_comp_count") or 0,
+        "metadata":{
+            "reason":"defensive_estimate_store",
+            "coverage_pct":market_summary.get("coverage_pct") or 0,
+            "positions":{
+                cid:{"value":round(float(state.get("current_value")),2),"currency":state.get("currency") or currency}
+                for cid,state in cards.items() if state.get("current_value") is not None
+            },
+            "market_summary_cache":market_summary,
+            "defensive_estimates":clean,
+            "defensive_estimate_summary":estimate_summary,
+        }
+    })
+
+
+@app.api_route("/api/v1/collection/market/defensive-estimates", methods=["GET","POST"])
+def defensive_collection_estimates():
+    """Conservative card-specific estimates for cards without verified comps.
+
+    V0.22.6.3 deliberately has two tiers:
+    1) semantic peers (same player/product/set) when available;
+    2) a low-confidence feature proxy anchored to the lower part of the user's VERIFIED
+       collection when exact peers do not exist. This avoids both the old one-price-for-all
+       fallback and the V0.22.6.1 problem where every unresolved card became unestimated.
+
+    Estimates are persisted separately and never become verified market values.
     """
     summary=_compute_collection_market_summary()
     states=summary.get("cards") or {}
@@ -1220,14 +1288,22 @@ def defensive_collection_estimates():
         if f['rpa']: m*=1.18
         if f['insert']: m*=1.04
         if f['short']: m*=1.12
-        m*=scarcity_factor(print_run(c))
-        return min(m,2.75)
+        # Damp scarcity for estimates; exact sold comps would justify a stronger premium.
+        sf=scarcity_factor(print_run(c)); m*=1.0+(sf-1.0)*0.62
+        return min(m,2.35)
 
-    estimates=[]; unresolved=[]
+    verified_values=[float(v['value']) for v in valued if v.get('value') is not None]
+    ordered_values=sorted(verified_values)
+    lower_half=ordered_values[:max(1,(len(ordered_values)+1)//2)]
+    defensive_collection_anchor=median(lower_half)
+    valued_mult_anchor=median([card_multiplier(v['card']) for v in valued]) or 1.0
+
+    previous, _previous_summary = _latest_defensive_estimate_payload()
+    fresh=[]; unresolved=[]
     for row in missing:
         c=row['card']; player=norm(c.get('primary_subject_name')); team=norm(c.get('team_name'))
         product=norm(c.get('product_line')); setn=norm(c.get('set_name')); year=norm(c.get('release_year') or c.get('season'))
-        candidates=[]
+        all_candidates=[]
         for v in valued:
             vc=v['card']; vp=norm(vc.get('primary_subject_name')); vproduct=norm(vc.get('product_line')); vset=norm(vc.get('set_name')); vyear=norm(vc.get('release_year') or vc.get('season'))
             score=0; reasons=[]
@@ -1239,32 +1315,81 @@ def defensive_collection_estimates():
             cf,vf=features(c),features(vc)
             for k in ('rookie','auto','relic','rpa','numbered','insert','short'):
                 if cf[k]==vf[k]: score+=0.6
-            # Require a real semantic anchor: same player OR same product/set.
-            if score>=7 and ('same_player' in reasons or 'same_product' in reasons or 'same_set' in reasons):
-                candidates.append((score,float(v['value']),vc,reasons))
-        candidates.sort(key=lambda x:x[0],reverse=True)
-        peers=candidates[:6]
-        if not peers:
-            unresolved.append(row['card_id']); continue
-        # Weighted median-like anchor: top similarity band, not collection median.
-        top=peers[0][0]; band=[p for p in peers if p[0]>=top-2.5]
-        base=median([p[1] for p in band])
-        # Adjust from peer feature package to target feature package, conservatively capped.
-        peer_mult=median([card_multiplier(p[2]) for p in band])
-        ratio=card_multiplier(c)/max(.5,peer_mult)
-        ratio=max(.55,min(1.65,ratio))
-        # Conservative haircut reflects that this is not an exact sold comp.
-        estimate=max(.50,base*ratio*.82)
-        same_player=sum(1 for p in band if 'same_player' in p[3])
-        confidence='mittel' if same_player>=2 else ('mittel' if len(band)>=3 and top>=10 else 'niedrig')
-        spread=.22 if confidence=='mittel' else .35
-        low=max(.50,estimate*(1-spread)); high=estimate*(1+spread)
-        basis='same_player' if same_player else ('same_product' if any('same_product' in p[3] for p in band) else 'same_set')
-        estimates.append({"card_id":row['card_id'],"estimate":round(estimate,2),"low":round(low,2),"high":round(high,2),"currency":summary.get('currency') or 'USD',"confidence":confidence,"basis":basis,"peer_count":len(band),"anchor_value":round(base,2),"feature_ratio":round(ratio,3)})
+            all_candidates.append((score,float(v['value']),vc,reasons))
 
-    est_sum=sum(x['estimate'] for x in estimates); low_sum=sum(x['low'] for x in estimates); high_sum=sum(x['high'] for x in estimates)
+        semantic=[p for p in all_candidates if p[0]>=7 and any(r in p[3] for r in ('same_player','same_product','same_set'))]
+        semantic.sort(key=lambda x:x[0],reverse=True)
+        basis=''; confidence='niedrig'; peer_count=0
+        if semantic:
+            top=semantic[0][0]; band=[p for p in semantic[:8] if p[0]>=top-2.5]
+            base=median([p[1] for p in band])
+            peer_mult=median([card_multiplier(p[2]) for p in band])
+            ratio=max(.55,min(1.65,card_multiplier(c)/max(.5,peer_mult)))
+            estimate=max(.50,base*ratio*.82)
+            same_player=sum(1 for p in band if 'same_player' in p[3])
+            confidence='mittel' if same_player>=2 or (len(band)>=3 and top>=10) else 'niedrig'
+            basis='same_player' if same_player else ('same_product' if any('same_product' in p[3] for p in band) else 'same_set')
+            peer_count=len(band)
+        else:
+            # Broader, still card-specific internal proxy. Prefer the closest verified cards
+            # by year/team/feature package; only use collection anchor if there is no useful peer.
+            broad=sorted([p for p in all_candidates if p[0]>=2.0], key=lambda x:x[0], reverse=True)[:6]
+            if broad:
+                top=broad[0][0]; band=[p for p in broad if p[0]>=max(2.0,top-2.0)]
+                base=median([p[1] for p in band])
+                peer_mult=median([card_multiplier(p[2]) for p in band])
+                ratio=max(.62,min(1.48,card_multiplier(c)/max(.5,peer_mult)))
+                # Stronger haircut because these are only structural peers.
+                estimate=max(.50,base*ratio*.68)
+                basis='feature_peer_proxy'; peer_count=len(band)
+            else:
+                # Final low-confidence fallback is anchored to the LOWER HALF of real prices,
+                # then individualized by the target card's own rookie/auto/relic/rarity package.
+                ratio=max(.62,min(1.55,card_multiplier(c)/max(.5,valued_mult_anchor)))
+                estimate=max(.50,defensive_collection_anchor*ratio*.72)
+                basis='verified_collection_feature_proxy'; peer_count=0
+            confidence='niedrig'
+
+        # Conservative caps prevent a proxy estimate from challenging high-end verified cards.
+        cap=max(defensive_collection_anchor*2.75, 25.0)
+        if print_run(c) and print_run(c)<=25: cap=max(cap,45.0)
+        estimate=min(estimate,cap)
+        spread=.24 if confidence=='mittel' else .42
+        low=max(.50,estimate*(1-spread)); high=estimate*(1+spread)
+        fresh.append({
+            "card_id":row['card_id'],"estimate":round(estimate,2),"low":round(low,2),"high":round(high,2),
+            "currency":summary.get('currency') or 'USD',"confidence":confidence,"basis":basis,
+            "peer_count":peer_count,"anchor_value":round(base if 'base' in locals() else defensive_collection_anchor,2),
+            "feature_ratio":round(ratio,3),"estimated_at":datetime.now(timezone.utc).isoformat(),
+            "method":"card_specific_defensive_similarity_v3"
+        })
+
+    fresh_map={x['card_id']:x for x in fresh}
+    merged={cid:est for cid,est in (previous or {}).items() if isinstance(est,dict)}
+    merged.update(fresh_map)
+    # Verified prices always win and remove obsolete model values.
+    for cid,state in states.items():
+        if state.get('current_value') is not None:
+            merged.pop(cid,None)
+
+    vals=list(merged.values())
+    est_sum=sum(float(x.get('estimate') or 0) for x in vals)
+    low_sum=sum(float(x.get('low') or x.get('estimate') or 0) for x in vals)
+    high_sum=sum(float(x.get('high') or x.get('estimate') or 0) for x in vals)
     verified=float(summary.get('estimated_collection_value') or 0)
-    return {"status":"estimated","verified_total":round(verified,2),"estimated_missing_mid":round(est_sum,2),"combined_mid":round(verified+est_sum,2),"combined_low":round(verified+low_sum,2),"combined_high":round(verified+high_sum,2),"currency":summary.get('currency') or 'USD',"estimated_cards":len(estimates),"unresolved_cards":len(unresolved),"estimates":estimates,"method":"card_specific_defensive_similarity_v2","message":f"Kartenspezifische defensive Schätzung für {len(estimates)} Karten erstellt; {len(unresolved)} Karten ohne belastbare Vergleichsbasis bleiben ungeschätzt. Verifizierte Marktwerte bleiben unverändert."}
+    estimate_summary={
+        "status":"estimated","verified_total":round(verified,2),"estimated_missing_mid":round(est_sum,2),
+        "combined_mid":round(verified+est_sum,2),"combined_low":round(verified+low_sum,2),"combined_high":round(verified+high_sum,2),
+        "currency":summary.get('currency') or 'USD',"estimated_cards":len(vals),
+        "unresolved_cards":max(0,len(missing)-len(vals)),"method":"card_specific_defensive_similarity_v3",
+        "message":f"{len(fresh)} kartenspezifische defensive Schätzungen berechnet; {len(vals)} defensive Werte persistent gespeichert. Verifizierte Marktwerte bleiben unverändert."
+    }
+    try:
+        snapshot_id=_persist_defensive_estimates(merged,estimate_summary,summary)
+    except Exception as exc:
+        logger.exception("defensive estimate persistence failed")
+        raise HTTPException(500,f"Defensive estimate persist failed: {type(exc).__name__}: {exc}")
+    return {**estimate_summary,"estimates":vals,"new_estimates":len(fresh),"snapshot_id":snapshot_id}
 
 @app.post("/api/v1/collection/market/refresh")
 def refresh_collection_market():
@@ -1371,6 +1496,7 @@ def collection_market_history(limit_per_card: int = Query(5000,ge=1,le=10000)):
     durable=[]
     try:
         durable=db.list_collection_market_snapshots(limit=20000)
+        durable=[p for p in (durable or []) if (p.get("metadata") or {}).get("reason") != "defensive_estimate_store"]
     except Exception:
         durable=[]
     if durable:
