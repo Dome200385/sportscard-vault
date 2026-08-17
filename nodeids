@@ -1,0 +1,18 @@
+[
+  "tests/test_api.py::test_auto_confirm_scan_requires_review_then_saves_without_manual_form",
+  "tests/test_api.py::test_exact_identity_is_reused_for_multiple_owned_copies",
+  "tests/test_api.py::test_manual_card_collection_and_pricing",
+  "tests/test_api.py::test_preflight_marks_render_tmp_sqlite_as_non_persistent",
+  "tests/test_api.py::test_scan_safe_mode_returns_detailed_confirmation_fields",
+  "tests/test_catalog.py::test_catalog_prefers_exact_parallel_and_number",
+  "tests/test_market_providers.py::test_normalizer_marks_extreme_outlier_excluded",
+  "tests/test_market_providers.py::test_sold_listing_accepts_exact_raw_card",
+  "tests/test_market_providers.py::test_sold_listing_rejects_wrong_number_and_graded",
+  "tests/test_pricing.py::test_mixed_currency_is_rejected",
+  "tests/test_pricing.py::test_three_comps_use_median",
+  "tests/test_pricing.py::test_two_comps_never_create_fantasy_value",
+  "tests/test_recognition.py::test_no_market_value_field_in_recognition_schema",
+  "tests/test_recognition.py::test_parallel_needs_high_confidence",
+  "tests/test_recognition.py::test_prompt_json_example_does_not_trigger_python_formatting",
+  "tests/test_recognition.py::test_safe_mode_keeps_locks_and_does_not_guess"
+]
