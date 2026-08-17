@@ -81,6 +81,18 @@ create table if not exists public.market_price_snapshots (
   recorded_at timestamptz not null default now()
 );
 create index if not exists idx_market_price_snapshots_card_time on public.market_price_snapshots(card_identity_id, recorded_at desc);
+
+create table if not exists public.collection_market_snapshots (
+  id uuid primary key default gen_random_uuid(),
+  value numeric(14,2) not null,
+  currency text not null,
+  valued_cards integer not null default 0,
+  total_cards integer not null default 0,
+  included_comp_count integer not null default 0,
+  metadata_json jsonb not null default '{}'::jsonb,
+  recorded_at timestamptz not null default now()
+);
+create index if not exists idx_collection_market_snapshots_time on public.collection_market_snapshots(recorded_at asc);
 '''
 
 
@@ -307,6 +319,36 @@ def list_market_snapshots(card_id: str, limit: int = 365) -> list[dict]:
         'id':str(r['id']),'value':float(r['value']),'currency':r['currency'],'source':r['source'],
         'confidence':float(r['confidence']) if r['confidence'] is not None else None,'snapshot_type':r['snapshot_type'],
         'comp_count':int(r['comp_count'] or 0),'metadata':r['metadata_json'] or {},'recorded_at':r['recorded_at']
+    } for r in rows]
+
+
+def add_collection_market_snapshot(snapshot: dict) -> str:
+    sid=str(uuid4())
+    with connect() as con, con.cursor() as cur:
+        cur.execute(
+            "insert into public.collection_market_snapshots "
+            "(id,value,currency,valued_cards,total_cards,included_comp_count,metadata_json,recorded_at) "
+            "values (%s,%s,%s,%s,%s,%s,%s,coalesce(%s::timestamptz,now()))",
+            (sid,float(snapshot['value']),snapshot.get('currency') or 'USD',int(snapshot.get('valued_cards') or 0),
+             int(snapshot.get('total_cards') or 0),int(snapshot.get('included_comp_count') or 0),
+             Jsonb(snapshot.get('metadata') or {}),snapshot.get('recorded_at'))
+        )
+        con.commit()
+    return sid
+
+def list_collection_market_snapshots(limit: int = 10000) -> list[dict]:
+    limit=min(max(int(limit or 10000),1),20000)
+    with connect() as con, con.cursor() as cur:
+        cur.execute(
+            "select id,value,currency,valued_cards,total_cards,included_comp_count,metadata_json,recorded_at "
+            "from public.collection_market_snapshots order by recorded_at asc limit %s", (limit,)
+        )
+        rows=cur.fetchall()
+    return [{
+        'id':str(r['id']),'value':float(r['value']),'currency':r['currency'],
+        'valued_cards':int(r['valued_cards'] or 0),'total_cards':int(r['total_cards'] or 0),
+        'included_comp_count':int(r['included_comp_count'] or 0),'metadata':r['metadata_json'] or {},
+        'recorded_at':r['recorded_at']
     } for r in rows]
 
 def save_scan(front: str, back: str | None, locked_context: dict, output: dict, scan_id: str | None = None) -> str:

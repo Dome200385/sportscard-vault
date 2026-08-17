@@ -195,6 +195,20 @@ def list_market_snapshots(card_id: str, limit: int = 365) -> list[dict]:
         d=dict(r.get('data_json') or {}); d['id']=r['id']; d['recorded_at']=r['recorded_at']; out.append(d)
     return out
 
+
+def add_collection_market_snapshot(snapshot: dict) -> str:
+    sid=str(uuid4()); payload=dict(snapshot); recorded=payload.pop('recorded_at',None) or now_iso()
+    client().table("collection_market_snapshots").insert({"id":sid,"data_json":payload,"recorded_at":recorded}).execute()
+    return sid
+
+def list_collection_market_snapshots(limit: int = 10000) -> list[dict]:
+    limit=min(max(int(limit or 10000),1),20000)
+    rows=client().table("collection_market_snapshots").select("*").order("recorded_at").limit(limit).execute().data or []
+    out=[]
+    for r in rows:
+        d=dict(r.get('data_json') or {}); d['id']=r['id']; d['recorded_at']=r['recorded_at']; out.append(d)
+    return out
+
 def save_scan(front: str, back: str | None, locked_context: dict, output: dict, scan_id: str | None = None) -> str:
     sid = scan_id or str(uuid4())
     client().table("scan_events").insert({

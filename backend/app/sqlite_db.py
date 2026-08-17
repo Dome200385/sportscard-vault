@@ -42,6 +42,11 @@ CREATE TABLE IF NOT EXISTS market_price_snapshots (
   data_json TEXT NOT NULL,
   recorded_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS collection_market_snapshots (
+  id TEXT PRIMARY KEY,
+  data_json TEXT NOT NULL,
+  recorded_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS scan_events (
   id TEXT PRIMARY KEY,
   front_image_path TEXT,
@@ -66,6 +71,7 @@ CREATE INDEX IF NOT EXISTS idx_identity_search ON card_identities(sport, season,
 CREATE INDEX IF NOT EXISTS idx_instances_identity ON card_instances(card_identity_id);
 CREATE INDEX IF NOT EXISTS idx_comps_identity ON market_comps(card_identity_id);
 CREATE INDEX IF NOT EXISTS idx_market_snapshots_card_time ON market_price_snapshots(card_identity_id, recorded_at);
+CREATE INDEX IF NOT EXISTS idx_collection_market_snapshots_time ON collection_market_snapshots(recorded_at);
 CREATE INDEX IF NOT EXISTS idx_scan_created ON scan_events(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_scan_corrections_scan ON scan_corrections(scan_id);
 """
@@ -206,6 +212,22 @@ def list_market_snapshots(card_id: str, limit: int = 365) -> list[dict]:
     limit=min(max(int(limit or 365),1),10000)
     with connect() as con:
         rows=con.execute("SELECT * FROM market_price_snapshots WHERE card_identity_id=? ORDER BY recorded_at ASC LIMIT ?",(card_id,limit)).fetchall()
+    out=[]
+    for r in rows:
+        d=json.loads(r['data_json']); d['id']=r['id']; d['recorded_at']=r['recorded_at']; out.append(d)
+    return out
+
+
+def add_collection_market_snapshot(snapshot: dict) -> str:
+    sid=str(uuid4()); row=dict(snapshot); recorded=row.pop('recorded_at',None) or now_iso()
+    with connect() as con:
+        con.execute("INSERT INTO collection_market_snapshots VALUES (?,?,?)",(sid,json.dumps(row,ensure_ascii=False,default=str),recorded))
+    return sid
+
+def list_collection_market_snapshots(limit: int = 10000) -> list[dict]:
+    limit=min(max(int(limit or 10000),1),20000)
+    with connect() as con:
+        rows=con.execute("SELECT * FROM collection_market_snapshots ORDER BY recorded_at ASC LIMIT ?",(limit,)).fetchall()
     out=[]
     for r in rows:
         d=json.loads(r['data_json']); d['id']=r['id']; d['recorded_at']=r['recorded_at']; out.append(d)
