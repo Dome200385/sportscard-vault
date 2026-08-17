@@ -4,6 +4,7 @@ import json
 import shutil
 import asyncio
 import logging
+import threading
 from pathlib import Path
 from uuid import uuid4
 from datetime import datetime, timezone, timedelta
@@ -11,6 +12,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, FileResponse, Response
+from PIL import Image, ImageOps
 from .config import settings
 from . import db
 from .schemas import CardCreateRequest, ManualCompIn, ScanResponse, ConfirmScanRequest, AutoConfirmScanRequest, ValuationOut, CardIdentityIn, OwnedInstanceIn
@@ -25,7 +27,7 @@ STATIC_INDEX = Path(__file__).resolve().parent.parent / "static" / "index.html"
 
 logger = logging.getLogger("sportscard-vault")
 
-app = FastAPI(title="SportsCard Vault API", version="0.22.2", description="Detailed sports-card collection API with editable scan review, correction learning data, transparent comp-based valuation, and an offline-first test UI.")
+app = FastAPI(title="SportsCard Vault API", version="0.22.4.9", description="Detailed sports-card collection API with editable scan review, correction learning data, transparent comp-based valuation, and an offline-first test UI.")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=False, allow_methods=["*"], allow_headers=["*"])
 
 from contextlib import asynccontextmanager
@@ -43,18 +45,24 @@ async def lifespan(app: FastAPI):
             db.activate_sqlite_fallback(f"Startup DB error: {type(exc).__name__}: {exc}")
         except Exception:
             logger.exception("sqlite fallback initialization also failed")
+    # V0.22.4.9: warm a missing legacy market cache in the background after deploy.
+    # The service remains responsive while this one-time persisted-comp calculation runs.
+    try:
+        _ensure_collection_market_cache_warmup()
+    except Exception:
+        logger.exception("market cache warmup scheduling failed")
     yield
 
 # Assign lifespan after app construction for compatibility with the existing scaffold.
 app.router.lifespan_context = lifespan
 
 @app.get("/health")
-def health(): return {"status":"ok","version":"0.22.2","environment":settings.app_env,"recognition":settings.recognition_provider,"pricing_provider":settings.price_provider,"database_provider":settings.database_provider}
+def health(): return {"status":"ok","version":"0.22.4.9","environment":settings.app_env,"recognition":settings.recognition_provider,"pricing_provider":settings.price_provider,"database_provider":settings.database_provider}
 
 
 def _serve_test_ui():
     if STATIC_INDEX.exists():
-        # V0.22.2: always serve the deployed backend/static dashboard and
+        # V0.22.3: always serve the deployed backend/static dashboard and
         # prevent browsers/CDNs from holding on to an older UI after deploys.
         return FileResponse(
             STATIC_INDEX,
@@ -236,9 +244,12 @@ def image_blob_metadata(image_id: str):
         raise HTTPException(500, detail=f"Image metadata read failed: {type(exc).__name__}")
 
 @app.get("/api/v1/images/{image_id}", include_in_schema=True)
-def image_blob(image_id: str):
-    """Serve an image persisted in Postgres fallback storage."""
-    # Accept a copied pgimg:// reference as well as the bare UUID.
+def image_blob(image_id: str, w: int | None = Query(None, ge=96, le=1600)):
+    """Serve a persisted image; optionally return a lightweight thumbnail.
+
+    Collection cards use ``?w=480`` so phones do not download multi-megabyte
+    originals just to draw a small tile. Card detail still uses the original.
+    """
     image_id = (image_id or "").strip()
     if image_id.startswith("pgimg://"):
         image_id = image_id.split("://", 1)[1]
@@ -250,10 +261,29 @@ def image_blob(image_id: str):
         raise HTTPException(500, detail=f"Image read failed: {type(exc).__name__}")
     if not row:
         raise HTTPException(404, "Image not found")
+    raw = bytes(row["data"])
+    media_type = row.get("content_type") or "application/octet-stream"
+    if w:
+        try:
+            source = Image.open(io.BytesIO(raw))
+            source = ImageOps.exif_transpose(source)
+            source.thumbnail((w, int(w * 1.5)), Image.Resampling.LANCZOS)
+            if source.mode not in ("RGB", "L"):
+                source = source.convert("RGB")
+            out = io.BytesIO()
+            source.save(out, format="JPEG", quality=80, optimize=True)
+            raw = out.getvalue()
+            media_type = "image/jpeg"
+        except Exception:
+            logger.warning("thumbnail generation failed for %s; serving original", image_id, exc_info=True)
     return Response(
-        content=bytes(row["data"]),
-        media_type=row.get("content_type") or "application/octet-stream",
-        headers={"Cache-Control": "private, max-age=3600", "X-Image-Storage": "postgres"},
+        content=raw,
+        media_type=media_type,
+        headers={
+            "Cache-Control": "private, max-age=86400" if w else "private, max-age=3600",
+            "X-Image-Storage": "postgres",
+            "X-Image-Variant": f"thumb-{w}" if w else "original",
+        },
     )
 
 @app.get("/api/v1/collection/summary")
@@ -285,6 +315,40 @@ def create_manual_card(payload: CardCreateRequest):
 @app.get("/api/v1/collection")
 def collection(q: str | None=None, sport: str | None=None, page: int=Query(1,ge=1), page_size: int=Query(50,ge=1,le=200)):
     return db.list_collection(q=q,sport=sport,page=page,page_size=page_size)
+
+@app.get("/api/v1/collection/feed")
+def collection_feed(q: str | None=None, page: int=Query(1,ge=1), page_size: int=Query(12,ge=1,le=48)):
+    """Compact paged collection feed for the UI.
+
+    V0.22.4 removes the browser-side N+1 pattern where opening the collection
+    requested /cards/{id} once for every card before anything could render.
+    This endpoint returns only the fields required for tiles in one request.
+    """
+    listing = db.list_collection(q=q, page=page, page_size=page_size)
+    base_items = listing.get("items", []) if isinstance(listing, dict) else []
+
+    def compact(item: dict) -> dict:
+        cid = item.get("id") or item.get("card_identity_id")
+        card = db.get_card(cid) if cid else None
+        identity = (card or {}).get("identity") or item
+        instances = (card or {}).get("instances") or []
+        first = instances[0] if instances else {}
+        return {
+            **identity,
+            "id": cid or identity.get("id"),
+            "instance_count": len(instances) or int(item.get("owned_quantity") or 1),
+            "front_image_url": signed_url(first.get("front_image_path")) if first.get("front_image_path") else None,
+            "back_image_url": signed_url(first.get("back_image_path")) if first.get("back_image_path") else None,
+        }
+
+    if len(base_items) > 1:
+        workers = min(6, len(base_items))
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            items = list(pool.map(compact, base_items))
+    else:
+        items = [compact(x) for x in base_items]
+    total = listing.get("total") if isinstance(listing, dict) else len(items)
+    return {"items": items, "page": page, "page_size": page_size, "total": total, "has_more": page * page_size < int(total or 0)}
 
 @app.get("/api/v1/cards/{card_id}")
 def card_detail(card_id: str):
@@ -661,8 +725,14 @@ def market_match_preview(payload: dict):
     fp=build_fingerprint(card)
     return {"card_id":card_id,"fingerprint":fp.as_dict(),"match":score_candidate(fp,candidate)}
 
-@app.get("/api/v1/collection/market-summary")
-def collection_market_summary():
+def _compute_collection_market_summary():
+    """Compute a fresh summary from persisted per-card market data. Used only when a snapshot is created or as a legacy fallback.
+
+    V0.22.4.4 intentionally does *not* read per-card price history here.
+    Opening the collection only needs each card's already stored comps/current
+    value. Historical snapshots are loaded separately by /collection/market-history.
+    No provider/SoldComps request is made.
+    """
     items=[]; page=1; page_size=200
     while True:
         listing=db.list_collection(page=page,page_size=page_size)
@@ -671,40 +741,211 @@ def collection_market_summary():
         if len(batch) < page_size: break
         page += 1
         if page > 100: break
-    valued=0; total=0.0; currencies=set(); missing=0; comp_count=0; cards={}
-    current_by_card={}; base7_by_card={}; base30_by_card={}; latest_dates=[]
+
+    card_ids=[]
     for item in items:
         cid=item.get("id") or item.get("card_identity_id")
-        if not cid: continue
-        try: state=_card_market_state(cid,history_limit=365)
-        except KeyError: continue
-        cards[cid]={k:state[k] for k in ['current_value','currency','source','confidence','last_updated','change_7d_pct','change_30d_pct','included_comp_count','reliable']}
-        cards[cid]['history_points']=len(state['history']); cards[cid]['history']=[{k:p.get(k) for k in ('value','currency','recorded_at')} for p in state['history'][-90:]]
-        comp_count += state['included_comp_count']
-        if state['last_updated']: latest_dates.append(state['last_updated'])
-        if state['current_value'] is None:
-            missing += 1; continue
-        current=float(state['current_value']); total += current; valued += 1
-        if state['currency']: currencies.add(state['currency'])
-        current_by_card[cid]=current
-        base7=_baseline_value(state['history'],7); base30=_baseline_value(state['history'],30)
-        if base7 is not None: base7_by_card[cid]=base7
-        if base30 is not None: base30_by_card[cid]=base30
+        if cid and cid not in card_ids: card_ids.append(cid)
+
+    cards={}; valued=0; total=0.0; missing=0; comp_count=0; currencies=set(); latest_dates=[]
+    for cid in card_ids:
+        try:
+            card=db.get_card(cid)
+            if not card:
+                missing += 1
+                continue
+            comps=card.get("comps") or []
+            usable=[c for c in comps if c.get("included_in_valuation",True) and c.get("price") is not None]
+            values=[float(c["price"]) for c in usable]
+            current=_median(values)
+            currency=next((c.get("currency") for c in usable if c.get("currency")),None)
+            source="verified_comps" if current is not None else None
+            confidence=min(1.0,len(usable)/max(1,settings.min_reliable_comps)) if current is not None else None
+            sold_dates=[_parse_dt(c.get("sold_at") or c.get("created_at")) for c in usable]
+            sold_dates=[d for d in sold_dates if d]
+            last_updated=max(sold_dates).isoformat() if sold_dates else None
+
+            # Provider-only values are uncommon in this installation, but preserve
+            # them without loading the full history: request only the latest point.
+            if current is None:
+                try:
+                    hist=db.list_market_snapshots(cid,limit=1)
+                except Exception:
+                    hist=[]
+                latest=hist[-1] if hist else None
+                if latest and latest.get("value") is not None:
+                    current=float(latest["value"]); currency=latest.get("currency")
+                    source=latest.get("source") or latest.get("snapshot_type") or "provider"
+                    confidence=latest.get("confidence")
+                    last_updated=latest.get("recorded_at")
+
+            state={
+                "card_id":cid,"current_value":current,"currency":currency,"source":source,
+                "confidence":confidence,"last_updated":last_updated,
+                "change_7d_pct":None,"change_30d_pct":None,"history":[],
+                "comp_count":len(comps),"included_comp_count":len(usable),
+                "low":min(values) if values else None,"high":max(values) if values else None,
+                "reliable":len(usable)>=settings.min_reliable_comps,
+            }
+            cards[cid]=state
+            comp_count += len(usable)
+            if last_updated: latest_dates.append(last_updated)
+            if current is None:
+                missing += 1
+                continue
+            valued += 1; total += float(current)
+            if currency: currencies.add(currency)
+        except Exception:
+            missing += 1
+            logger.exception("Deferred lightweight market state failed for %s",cid)
+
     currency=next(iter(currencies)) if len(currencies)==1 else ("MIXED" if currencies else None)
     considered=len(items)
-    base7_total=sum(base7_by_card.values()) if base7_by_card and set(current_by_card).issubset(set(base7_by_card)) else None
-    base30_total=sum(base30_by_card.values()) if base30_by_card and set(current_by_card).issubset(set(base30_by_card)) else None
     return {
         "cards_considered":considered,"valued_cards":valued,"cards_without_comps":missing,
         "included_comp_count":comp_count,"coverage_pct":round((valued/considered*100),1) if considered else 0.0,
         "estimated_collection_value":round(total,2) if valued else None,"currency":currency,
-        "change_7d_pct":_pct_change(total,base7_total),"change_30d_pct":_pct_change(total,base30_total),
+        "change_7d_pct":None,"change_30d_pct":None,
         "last_market_update":max(latest_dates) if latest_dates else None,"cards":cards,
-        "method":"sum_of_current_verified_comp_medians_or_provider_snapshots","status":"valued" if valued else "waiting_for_comps"
+        "method":"lightweight_persisted_comps_no_history_no_provider_calls",
+        "status":"valued" if valued else "waiting_for_comps"
     }
 
+
+def _cached_market_summary_from_snapshot():
+    """Return the newest usable precomputed/positioned summary without per-card reads.
+
+    V0.22.4.9 no longer assumes a database-specific ordering for snapshot lists.
+    It scans newest-first for a full cache, then newest-first for a legacy positioned
+    snapshot. This lets existing V0.22.x snapshots become instant caches immediately.
+    """
+    try:
+        snaps=db.list_collection_market_snapshots(limit=200)
+    except Exception:
+        return None
+    if not snaps:
+        return None
+    ordered=sorted(snaps,key=lambda x:str(x.get("recorded_at") or ""),reverse=True)
+
+    # Prefer the newest full dashboard cache.
+    for snap in ordered:
+        meta=snap.get("metadata") or {}
+        cached=meta.get("market_summary_cache")
+        if isinstance(cached,dict) and isinstance(cached.get("cards"),dict):
+            out=dict(cached)
+            out["method"]="precomputed_collection_snapshot_cache"
+            out["cache_recorded_at"]=snap.get("recorded_at")
+            return out
+
+    # Compatibility path: use the newest snapshot that already froze per-card positions.
+    latest=None; positions=None
+    for snap in ordered:
+        pos=(snap.get("metadata") or {}).get("positions")
+        if isinstance(pos,dict) and pos:
+            latest=snap; positions=pos; break
+    if latest is None or not positions:
+        return None
+
+    cards={}; currencies=set(); total=0.0
+    for cid,pos in positions.items():
+        if not isinstance(pos,dict) or pos.get("value") is None:
+            continue
+        value=float(pos["value"]); currency=pos.get("currency") or latest.get("currency")
+        cards[cid]={"card_id":cid,"current_value":value,"currency":currency,"source":"snapshot_cache",
+                    "confidence":None,"last_updated":latest.get("recorded_at"),"change_7d_pct":None,"change_30d_pct":None,
+                    "history":[],"comp_count":0,"included_comp_count":0,"low":None,"high":None,"reliable":False}
+        total += value
+        if currency: currencies.add(currency)
+    try:
+        current_total=int((db.list_collection(page=1,page_size=1) or {}).get("total") or latest.get("total_cards") or len(cards))
+    except Exception:
+        current_total=int(latest.get("total_cards") or len(cards))
+    valued=len(cards)
+    currency=latest.get("currency") or (next(iter(currencies)) if len(currencies)==1 else ("MIXED" if currencies else None))
+    return {
+        "cards_considered":current_total,"valued_cards":valued,"cards_without_comps":max(0,current_total-valued),
+        "included_comp_count":int(latest.get("included_comp_count") or 0),
+        "coverage_pct":round((valued/current_total*100),1) if current_total else 0.0,
+        "estimated_collection_value":round(float(latest.get("value") if latest.get("value") is not None else total),2) if valued else None,
+        "currency":currency,"change_7d_pct":None,"change_30d_pct":None,"last_market_update":latest.get("recorded_at"),
+        "cards":cards,"method":"legacy_portfolio_snapshot_cache","status":"valued" if valued else "waiting_for_comps",
+        "cache_recorded_at":latest.get("recorded_at")
+    }
+
+
+_market_cache_lock = threading.Lock()
+_market_cache_building = False
+_market_cache_error: str | None = None
+_market_cache_started_at: str | None = None
+
+def _build_collection_market_cache_background():
+    """Build one durable cache from already persisted comps without provider calls.
+
+    This may take a while on legacy installations, therefore it must never run in the
+    normal GET request path. Once written, future collection opens are O(1)-style reads.
+    """
+    global _market_cache_building, _market_cache_error
+    try:
+        sid=_record_collection_market_snapshot("market_cache_bootstrap")
+        if not sid:
+            _market_cache_error="Cache konnte noch nicht aufgebaut werden; es sind keine bewertbaren Marktdaten vorhanden."
+        else:
+            _market_cache_error=None
+            logger.info("collection market cache bootstrap completed: %s",sid)
+    except Exception as exc:
+        _market_cache_error=f"{type(exc).__name__}: {exc}"
+        logger.exception("collection market cache bootstrap failed")
+    finally:
+        with _market_cache_lock:
+            _market_cache_building=False
+
+def _ensure_collection_market_cache_warmup() -> bool:
+    """Start at most one background cache build. Returns True while a build is active."""
+    global _market_cache_building, _market_cache_started_at
+    # Avoid rebuilding if a usable durable cache already exists.
+    try:
+        if _cached_market_summary_from_snapshot() is not None:
+            return False
+    except Exception:
+        pass
+    with _market_cache_lock:
+        if _market_cache_building:
+            return True
+        _market_cache_building=True
+        _market_cache_started_at=datetime.now(timezone.utc).isoformat()
+        threading.Thread(target=_build_collection_market_cache_background,daemon=True,name="market-cache-bootstrap").start()
+        return True
+
+@app.get("/api/v1/collection/market-summary")
+def collection_market_summary():
+    """V0.22.4.9: collection GETs never perform the expensive per-card comp walk.
+
+    If no compatible durable cache exists yet, a one-time background bootstrap is
+    started and this endpoint returns immediately. No SoldComps/provider request is made.
+    """
+    cached=_cached_market_summary_from_snapshot()
+    if cached is not None:
+        cached["cache_ready"]=True
+        return cached
+    _ensure_collection_market_cache_warmup()
+    try:
+        listing=db.list_collection(page=1,page_size=1) or {}
+        total=int(listing.get("total") or 0) if isinstance(listing,dict) else 0
+    except Exception:
+        total=0
+    return {
+        "status":"cache_warming","cache_ready":False,"cache_building":_market_cache_building,
+        "cache_started_at":_market_cache_started_at,"cache_error":_market_cache_error,
+        "cards_considered":total,"valued_cards":0,"cards_without_comps":total,
+        "included_comp_count":0,"coverage_pct":0.0,"estimated_collection_value":None,
+        "currency":None,"last_market_update":None,"cards":{},
+        "method":"background_snapshot_cache_bootstrap",
+        "message":"Marktcache wird einmalig aus bereits gespeicherten Comps aufgebaut. Keine Provider-Abfrage."
+    }
+
+
 def _record_collection_market_snapshot(reason: str = "market_refresh") -> str | None:
-    summary=collection_market_summary()
+    summary=_compute_collection_market_summary()
     value=summary.get("estimated_collection_value")
     currency=summary.get("currency")
     if value is None or not currency or currency == "MIXED":
@@ -718,7 +959,10 @@ def _record_collection_market_snapshot(reason: str = "market_refresh") -> str | 
                 "positions":{
                     cid:{"value":round(float(state.get("current_value")),2),"currency":state.get("currency") or currency}
                     for cid,state in (summary.get("cards") or {}).items() if state.get("current_value") is not None
-                }
+                },
+                # V0.22.4.8: complete precomputed dashboard payload. Normal page loads
+                # read this JSON directly instead of scanning every card and comp.
+                "market_summary_cache":summary
             }
         })
     except Exception:
@@ -726,7 +970,7 @@ def _record_collection_market_snapshot(reason: str = "market_refresh") -> str | 
 
 @app.post("/api/v1/collection/market/performance-baseline")
 def create_collection_performance_baseline():
-    """Create one holdings-aware snapshot when V0.22.2 is first used.
+    """Create one holdings-aware snapshot when V0.22.3 is first used.
 
     This does not call a market provider and therefore consumes no SoldComps request.
     It only freezes the currently known card values/holdings so later additions and
@@ -851,6 +1095,9 @@ def collection_market_history(limit_per_card: int = Query(5000,ge=1,le=10000)):
         durable=db.list_collection_market_snapshots(limit=20000)
     except Exception:
         durable=[]
+    if durable:
+        points=sorted(({**p,"source":"portfolio_snapshot"} for p in durable if p.get("recorded_at")), key=lambda p:str(p.get("recorded_at")))
+        return {"history":points,"points":len(points),"cards":None,"durable_points":len(points),"method":"durable_portfolio_snapshots_fast_path"}
 
     listing=[]; page=1
     while True:
@@ -859,10 +1106,15 @@ def collection_market_history(limit_per_card: int = Query(5000,ge=1,le=10000)):
         if len(batch)<200 or page>=100: break
         page+=1
     histories={}
-    for item in listing:
-        cid=item.get("id") or item.get("card_identity_id")
-        if cid:
-            histories[cid]=db.list_market_snapshots(cid,limit=limit_per_card)
+    history_ids=[item.get("id") or item.get("card_identity_id") for item in listing]
+    history_ids=[cid for cid in history_ids if cid]
+    def _load_history(cid):
+        return cid,db.list_market_snapshots(cid,limit=limit_per_card)
+    if len(history_ids)>1:
+        with ThreadPoolExecutor(max_workers=min(8,len(history_ids))) as pool:
+            histories=dict(pool.map(_load_history,history_ids))
+    else:
+        histories=dict(_load_history(cid) for cid in history_ids)
     moments=sorted({str(p.get("recorded_at")) for h in histories.values() for p in h if p.get("recorded_at") and p.get("value") is not None})
     legacy=[]; latest={}; cursors={cid:0 for cid in histories}
     for moment in moments:
