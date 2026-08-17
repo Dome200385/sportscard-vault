@@ -1,8 +1,18 @@
-# pytest cache directory #
+# SportsCard Vault V0.8
 
-This directory contains data from the pytest's cache plugin,
-which provides the `--lf` and `--ff` options, as well as the `cache` fixture.
+Scan-first Sports-Card-Collection-App für detaillierte Erfassung großer Sammlungen.
 
-**Do not** commit this to version control.
+## Testfokus dieser Version
+Vorder- und Rückseite fotografieren → automatische Vision-Analyse → detaillierte Felder mit Confidence → nur Unsicherheiten korrigieren → speichern.
 
-See [the docs](https://docs.pytest.org/en/stable/how-to/cache.html) for more information.
+## Deployment
+Siehe `DEPLOY_RENDER.md`.
+
+## Backend-Tests
+```bash
+cd backend
+pip install -r requirements.txt
+PYTHONPATH=. python -m pytest -q
+```
+
+Aktueller Stand: **10/10 Tests bestanden**.
