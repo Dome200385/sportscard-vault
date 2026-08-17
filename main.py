@@ -27,7 +27,7 @@ STATIC_INDEX = Path(__file__).resolve().parent.parent / "static" / "index.html"
 
 logger = logging.getLogger("sportscard-vault")
 
-app = FastAPI(title="SportsCard Vault API", version="0.22.4.9", description="Detailed sports-card collection API with editable scan review, correction learning data, transparent comp-based valuation, and an offline-first test UI.")
+app = FastAPI(title="SportsCard Vault API", version="0.22.4.12", description="Detailed sports-card collection API with editable scan review, correction learning data, transparent comp-based valuation, and an offline-first test UI.")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=False, allow_methods=["*"], allow_headers=["*"])
 
 from contextlib import asynccontextmanager
@@ -45,7 +45,7 @@ async def lifespan(app: FastAPI):
             db.activate_sqlite_fallback(f"Startup DB error: {type(exc).__name__}: {exc}")
         except Exception:
             logger.exception("sqlite fallback initialization also failed")
-    # V0.22.4.9: warm a missing legacy market cache in the background after deploy.
+    # V0.22.4.13: warm a missing legacy market cache in the background after deploy.
     # The service remains responsive while this one-time persisted-comp calculation runs.
     try:
         _ensure_collection_market_cache_warmup()
@@ -57,7 +57,7 @@ async def lifespan(app: FastAPI):
 app.router.lifespan_context = lifespan
 
 @app.get("/health")
-def health(): return {"status":"ok","version":"0.22.4.9","environment":settings.app_env,"recognition":settings.recognition_provider,"pricing_provider":settings.price_provider,"database_provider":settings.database_provider}
+def health(): return {"status":"ok","version":"0.22.4.12","environment":settings.app_env,"recognition":settings.recognition_provider,"pricing_provider":settings.price_provider,"database_provider":settings.database_provider}
 
 
 def _serve_test_ui():
@@ -815,7 +815,7 @@ def _compute_collection_market_summary():
 def _cached_market_summary_from_snapshot():
     """Return the newest usable precomputed/positioned summary without per-card reads.
 
-    V0.22.4.9 no longer assumes a database-specific ordering for snapshot lists.
+    V0.22.4.13 no longer assumes a database-specific ordering for snapshot lists.
     It scans newest-first for a full cache, then newest-first for a legacy positioned
     snapshot. This lets existing V0.22.x snapshots become instant caches immediately.
     """
@@ -916,32 +916,91 @@ def _ensure_collection_market_cache_warmup() -> bool:
         threading.Thread(target=_build_collection_market_cache_background,daemon=True,name="market-cache-bootstrap").start()
         return True
 
-@app.get("/api/v1/collection/market-summary")
-def collection_market_summary():
-    """V0.22.4.9: collection GETs never perform the expensive per-card comp walk.
 
-    If no compatible durable cache exists yet, a one-time background bootstrap is
-    started and this endpoint returns immediately. No SoldComps/provider request is made.
+@app.get("/api/v1/collection/market-cache")
+def collection_market_cache():
+    """V0.22.4.13: instant, strictly read-only collection market cache.
+
+    Normal collection opens never calculate market values, walk card comps, start a
+    background job, or call SoldComps/providers. The endpoint only reads an already
+    persisted collection snapshot. Expensive cache creation is explicit via
+    POST /api/v1/collection/market-cache/rebuild and is also performed after the
+    user's explicit collection market refresh.
     """
-    cached=_cached_market_summary_from_snapshot()
+    try:
+        cached=_cached_market_summary_from_snapshot()
+    except Exception as exc:
+        logger.warning("market-cache snapshot read failed: %s",exc)
+        cached=None
     if cached is not None:
-        cached["cache_ready"]=True
-        return cached
-    _ensure_collection_market_cache_warmup()
+        out=dict(cached)
+        out["cache_ready"]=True
+        out["status"]="valued" if out.get("estimated_collection_value") is not None else out.get("status","cache_ready")
+        out["method"]="instant_persisted_snapshot_cache"
+        return out
     try:
         listing=db.list_collection(page=1,page_size=1) or {}
         total=int(listing.get("total") or 0) if isinstance(listing,dict) else 0
     except Exception:
         total=0
     return {
-        "status":"cache_warming","cache_ready":False,"cache_building":_market_cache_building,
-        "cache_started_at":_market_cache_started_at,"cache_error":_market_cache_error,
+        "status":"cache_missing","cache_ready":False,"cards":{},
         "cards_considered":total,"valued_cards":0,"cards_without_comps":total,
         "included_comp_count":0,"coverage_pct":0.0,"estimated_collection_value":None,
-        "currency":None,"last_market_update":None,"cards":{},
-        "method":"background_snapshot_cache_bootstrap",
-        "message":"Marktcache wird einmalig aus bereits gespeicherten Comps aufgebaut. Keine Provider-Abfrage."
+        "currency":None,"last_market_update":None,"method":"instant_persisted_snapshot_cache",
+        "message":"Noch kein vollständiger Marktcache gespeichert. Einmalig 'Marktcache initialisieren' ausführen oder 'Marktdaten aktualisieren'."
     }
+
+@app.post("/api/v1/collection/market-cache/rebuild")
+def rebuild_collection_market_cache():
+    """Explicit one-time migration path for legacy persisted comps.
+
+    This may take a while, but it is never invoked while merely opening the collection.
+    It uses only already persisted data and makes zero SoldComps/provider requests.
+    Once complete, subsequent collection opens use the O(1)-style snapshot cache.
+    """
+    started=datetime.now(timezone.utc)
+    summary=_compute_collection_market_summary()
+    value=summary.get("estimated_collection_value")
+    currency=summary.get("currency")
+    if value is None or not currency or currency == "MIXED":
+        return {
+            "status":"not_available","cache_ready":False,
+            "elapsed_seconds":round((datetime.now(timezone.utc)-started).total_seconds(),2),
+            "message":"Aus den gespeicherten Daten konnte noch kein eindeutiger Sammlungswert erzeugt werden.",
+            "summary":summary,
+        }
+    try:
+        sid=db.add_collection_market_snapshot({
+            "value":value,"currency":currency,"valued_cards":summary.get("valued_cards") or 0,
+            "total_cards":summary.get("cards_considered") or 0,"included_comp_count":summary.get("included_comp_count") or 0,
+            "metadata":{
+                "reason":"manual_cache_rebuild","coverage_pct":summary.get("coverage_pct") or 0,
+                "positions":{
+                    cid:{"value":round(float(state.get("current_value")),2),"currency":state.get("currency") or currency}
+                    for cid,state in (summary.get("cards") or {}).items() if state.get("current_value") is not None
+                },
+                "market_summary_cache":summary,
+            }
+        })
+    except Exception as exc:
+        logger.exception("manual collection market cache rebuild persist failed")
+        raise HTTPException(500,f"Market cache persist failed: {type(exc).__name__}: {exc}")
+    return {
+        "status":"created","cache_ready":True,"snapshot_id":sid,
+        "elapsed_seconds":round((datetime.now(timezone.utc)-started).total_seconds(),2),
+        "summary":summary,
+        "message":"Marktcache aus bereits gespeicherten Daten aufgebaut. Keine Provider-Abfrage ausgeführt.",
+    }
+
+@app.get("/api/v1/collection/market-summary")
+def collection_market_summary():
+    """Compatibility alias for the instant persisted cache.
+
+    V0.22.4.13 deliberately performs no calculation on GET. Older frontends can call
+    this route safely without triggering a collection-wide comp scan.
+    """
+    return collection_market_cache()
 
 
 def _record_collection_market_snapshot(reason: str = "market_refresh") -> str | None:
@@ -960,7 +1019,7 @@ def _record_collection_market_snapshot(reason: str = "market_refresh") -> str | 
                     cid:{"value":round(float(state.get("current_value")),2),"currency":state.get("currency") or currency}
                     for cid,state in (summary.get("cards") or {}).items() if state.get("current_value") is not None
                 },
-                # V0.22.4.8: complete precomputed dashboard payload. Normal page loads
+                # V0.22.4.13: complete precomputed dashboard payload. Normal page loads
                 # read this JSON directly instead of scanning every card and comp.
                 "market_summary_cache":summary
             }
