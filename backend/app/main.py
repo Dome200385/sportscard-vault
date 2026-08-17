@@ -27,7 +27,7 @@ STATIC_INDEX = Path(__file__).resolve().parent.parent / "static" / "index.html"
 
 logger = logging.getLogger("sportscard-vault")
 
-app = FastAPI(title="SportsCard Vault API", version="0.22.5", description="Detailed sports-card collection API with editable scan review, correction learning data, transparent comp-based valuation, and an offline-first test UI.")
+app = FastAPI(title="SportsCard Vault API", version="0.22.6.0", description="Detailed sports-card collection API with editable scan review, correction learning data, transparent comp-based valuation, and an offline-first test UI.")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=False, allow_methods=["*"], allow_headers=["*"])
 
 from contextlib import asynccontextmanager
@@ -57,7 +57,7 @@ async def lifespan(app: FastAPI):
 app.router.lifespan_context = lifespan
 
 @app.get("/health")
-def health(): return {"status":"ok","version":"0.22.5","environment":settings.app_env,"recognition":settings.recognition_provider,"pricing_provider":settings.price_provider,"database_provider":settings.database_provider}
+def health(): return {"status":"ok","version":"0.22.6.0","environment":settings.app_env,"recognition":settings.recognition_provider,"pricing_provider":settings.price_provider,"database_provider":settings.database_provider}
 
 
 def _serve_test_ui():
@@ -1164,6 +1164,55 @@ def refresh_collection_market_coverage(max_requests: int = Query(20, ge=1, le=50
         ),
     }
 
+
+
+@app.get("/api/v1/collection/market/defensive-estimates")
+def defensive_collection_estimates():
+    """Conservative model layer for cards without verified comps.
+
+    This never replaces or persists a verified market value. Estimates are derived
+    only from this collection's already verified comp-based values, with similarity
+    weighting and deliberately conservative discounts.
+    """
+    summary=_compute_collection_market_summary()
+    states=summary.get("cards") or {}
+    valued=[]; missing=[]
+    for cid,state in states.items():
+        card=db.get_card(cid) or {}
+        row={"card_id":cid,"card":card,"value":state.get("current_value"),"currency":state.get("currency")}
+        (valued if state.get("current_value") is not None else missing).append(row)
+    vals=sorted(float(x["value"]) for x in valued if x.get("value") is not None)
+    if not vals:
+        return {"status":"no_verified_basis","estimates":[],"verified_total":summary.get("estimated_collection_value"),"message":"Keine verifizierte Preisbasis für defensive Modellschätzungen vorhanden."}
+    def median(a):
+        a=sorted(a); n=len(a); return a[n//2] if n%2 else (a[n//2-1]+a[n//2])/2
+    global_med=median(vals)
+    estimates=[]
+    for row in missing:
+        c=row["card"]; player=str(c.get("primary_subject_name") or '').strip().lower(); team=str(c.get("team_name") or '').strip().lower(); setn=str(c.get("set_name") or c.get("product_line") or '').strip().lower()
+        peers=[]; tier='collection'; factor=.55
+        for v in valued:
+            vc=v['card']; score=0
+            if player and str(vc.get('primary_subject_name') or '').strip().lower()==player: score+=5
+            if team and str(vc.get('team_name') or '').strip().lower()==team: score+=1
+            vs=str(vc.get('set_name') or vc.get('product_line') or '').strip().lower()
+            if setn and vs==setn: score+=2
+            if score>=5: peers.append(float(v['value']))
+        if peers: base=median(peers); tier='same_player'; factor=.72 if len(peers)>=2 else .62
+        else: base=global_med
+        # modest rarity modifiers, capped so sparse metadata cannot create extreme prices
+        mod=1.0
+        if c.get('is_rookie'): mod*=1.08
+        if c.get('is_autograph'): mod*=1.12
+        if c.get('is_relic'): mod*=1.05
+        if c.get('is_serial_numbered'): mod*=1.08
+        estimate=max(.5,base*factor*min(1.25,mod))
+        low=max(.5,estimate*.72); high=estimate*1.28
+        confidence='mittel' if tier=='same_player' and len(peers)>=2 else 'niedrig'
+        estimates.append({"card_id":row['card_id'],"estimate":round(estimate,2),"low":round(low,2),"high":round(high,2),"currency":summary.get('currency') or 'USD',"confidence":confidence,"basis":tier,"peer_count":len(peers)})
+    est_sum=sum(x['estimate'] for x in estimates); low_sum=sum(x['low'] for x in estimates); high_sum=sum(x['high'] for x in estimates)
+    verified=float(summary.get('estimated_collection_value') or 0)
+    return {"status":"estimated","verified_total":round(verified,2),"estimated_missing_mid":round(est_sum,2),"combined_mid":round(verified+est_sum,2),"combined_low":round(verified+low_sum,2),"combined_high":round(verified+high_sum,2),"currency":summary.get('currency') or 'USD',"estimated_cards":len(estimates),"estimates":estimates,"method":"defensive_similarity_model_verified_collection_basis","message":f"Defensive Modellschätzung für {len(estimates)} Karten erstellt. Verifizierte Marktwerte bleiben unverändert."}
 
 @app.post("/api/v1/collection/market/refresh")
 def refresh_collection_market():
