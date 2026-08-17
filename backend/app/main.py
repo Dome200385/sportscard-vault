@@ -4,6 +4,7 @@ import json
 import shutil
 import asyncio
 import logging
+import threading
 from pathlib import Path
 from uuid import uuid4
 from datetime import datetime, timezone, timedelta
@@ -26,7 +27,7 @@ STATIC_INDEX = Path(__file__).resolve().parent.parent / "static" / "index.html"
 
 logger = logging.getLogger("sportscard-vault")
 
-app = FastAPI(title="SportsCard Vault API", version="0.22.4.8", description="Detailed sports-card collection API with editable scan review, correction learning data, transparent comp-based valuation, and an offline-first test UI.")
+app = FastAPI(title="SportsCard Vault API", version="0.22.4.9", description="Detailed sports-card collection API with editable scan review, correction learning data, transparent comp-based valuation, and an offline-first test UI.")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=False, allow_methods=["*"], allow_headers=["*"])
 
 from contextlib import asynccontextmanager
@@ -44,13 +45,19 @@ async def lifespan(app: FastAPI):
             db.activate_sqlite_fallback(f"Startup DB error: {type(exc).__name__}: {exc}")
         except Exception:
             logger.exception("sqlite fallback initialization also failed")
+    # V0.22.4.9: warm a missing legacy market cache in the background after deploy.
+    # The service remains responsive while this one-time persisted-comp calculation runs.
+    try:
+        _ensure_collection_market_cache_warmup()
+    except Exception:
+        logger.exception("market cache warmup scheduling failed")
     yield
 
 # Assign lifespan after app construction for compatibility with the existing scaffold.
 app.router.lifespan_context = lifespan
 
 @app.get("/health")
-def health(): return {"status":"ok","version":"0.22.4.8","environment":settings.app_env,"recognition":settings.recognition_provider,"pricing_provider":settings.price_provider,"database_provider":settings.database_provider}
+def health(): return {"status":"ok","version":"0.22.4.9","environment":settings.app_env,"recognition":settings.recognition_provider,"pricing_provider":settings.price_provider,"database_provider":settings.database_provider}
 
 
 def _serve_test_ui():
@@ -806,30 +813,40 @@ def _compute_collection_market_summary():
 
 
 def _cached_market_summary_from_snapshot():
-    """Return the newest precomputed summary without touching per-card comps/history."""
+    """Return the newest usable precomputed/positioned summary without per-card reads.
+
+    V0.22.4.9 no longer assumes a database-specific ordering for snapshot lists.
+    It scans newest-first for a full cache, then newest-first for a legacy positioned
+    snapshot. This lets existing V0.22.x snapshots become instant caches immediately.
+    """
     try:
-        snaps=db.list_collection_market_snapshots(limit=50)
+        snaps=db.list_collection_market_snapshots(limit=200)
     except Exception:
         return None
     if not snaps:
         return None
-    latest=snaps[-1]
-    meta=latest.get("metadata") or {}
-    cached=meta.get("market_summary_cache")
-    if isinstance(cached,dict) and isinstance(cached.get("cards"),dict):
-        out=dict(cached)
-        out["method"]="precomputed_collection_snapshot_cache"
-        out["cache_recorded_at"]=latest.get("recorded_at")
-        return out
+    ordered=sorted(snaps,key=lambda x:str(x.get("recorded_at") or ""),reverse=True)
 
-    # Upgrade path for snapshots written before V0.22.4.8. Positions already contain
-    # the expensive part we need for a fast first paint: per-card values.
-    positions=meta.get("positions")
-    if not isinstance(positions,dict) or not positions:
+    # Prefer the newest full dashboard cache.
+    for snap in ordered:
+        meta=snap.get("metadata") or {}
+        cached=meta.get("market_summary_cache")
+        if isinstance(cached,dict) and isinstance(cached.get("cards"),dict):
+            out=dict(cached)
+            out["method"]="precomputed_collection_snapshot_cache"
+            out["cache_recorded_at"]=snap.get("recorded_at")
+            return out
+
+    # Compatibility path: use the newest snapshot that already froze per-card positions.
+    latest=None; positions=None
+    for snap in ordered:
+        pos=(snap.get("metadata") or {}).get("positions")
+        if isinstance(pos,dict) and pos:
+            latest=snap; positions=pos; break
+    if latest is None or not positions:
         return None
-    cards={}
-    currencies=set()
-    total=0.0
+
+    cards={}; currencies=set(); total=0.0
     for cid,pos in positions.items():
         if not isinstance(pos,dict) or pos.get("value") is None:
             continue
@@ -856,20 +873,129 @@ def _cached_market_summary_from_snapshot():
     }
 
 
+_market_cache_lock = threading.Lock()
+_market_cache_building = False
+_market_cache_error: str | None = None
+_market_cache_started_at: str | None = None
+
+def _build_collection_market_cache_background():
+    """Build one durable cache from already persisted comps without provider calls.
+
+    This may take a while on legacy installations, therefore it must never run in the
+    normal GET request path. Once written, future collection opens are O(1)-style reads.
+    """
+    global _market_cache_building, _market_cache_error
+    try:
+        sid=_record_collection_market_snapshot("market_cache_bootstrap")
+        if not sid:
+            _market_cache_error="Cache konnte noch nicht aufgebaut werden; es sind keine bewertbaren Marktdaten vorhanden."
+        else:
+            _market_cache_error=None
+            logger.info("collection market cache bootstrap completed: %s",sid)
+    except Exception as exc:
+        _market_cache_error=f"{type(exc).__name__}: {exc}"
+        logger.exception("collection market cache bootstrap failed")
+    finally:
+        with _market_cache_lock:
+            _market_cache_building=False
+
+def _ensure_collection_market_cache_warmup() -> bool:
+    """Start at most one background cache build. Returns True while a build is active."""
+    global _market_cache_building, _market_cache_started_at
+    # Avoid rebuilding if a usable durable cache already exists.
+    try:
+        if _cached_market_summary_from_snapshot() is not None:
+            return False
+    except Exception:
+        pass
+    with _market_cache_lock:
+        if _market_cache_building:
+            return True
+        _market_cache_building=True
+        _market_cache_started_at=datetime.now(timezone.utc).isoformat()
+        threading.Thread(target=_build_collection_market_cache_background,daemon=True,name="market-cache-bootstrap").start()
+        return True
+
+
+@app.get("/api/v1/collection/market-cache")
+def collection_market_cache():
+    """V0.22.4.10: ultra-light read-only snapshot endpoint.
+
+    Never walks cards/comps and never starts a background build. It reads only the
+    newest persisted collection snapshot, so normal collection opens stay fast.
+    Provider/SoldComps work remains exclusive to the explicit market refresh action.
+    """
+    try:
+        snaps=db.list_collection_market_snapshots(limit=1) or []
+    except Exception as exc:
+        logger.warning("market-cache snapshot read failed: %s",exc)
+        return {
+            "status":"cache_unavailable","cache_ready":False,"cards":{},
+            "cards_considered":0,"valued_cards":0,"cards_without_comps":0,
+            "included_comp_count":0,"coverage_pct":0.0,"estimated_collection_value":None,
+            "currency":None,"last_market_update":None,"method":"snapshot_only_fast_path",
+            "message":"Gespeicherter Marktcache konnte nicht gelesen werden."
+        }
+    if not snaps:
+        return {
+            "status":"cache_missing","cache_ready":False,"cards":{},
+            "cards_considered":0,"valued_cards":0,"cards_without_comps":0,
+            "included_comp_count":0,"coverage_pct":0.0,"estimated_collection_value":None,
+            "currency":None,"last_market_update":None,"method":"snapshot_only_fast_path",
+            "message":"Noch kein gespeicherter Marktcache vorhanden."
+        }
+    snap=snaps[0] or {}
+    meta=snap.get("metadata") or {}
+    cached=meta.get("market_summary_cache")
+    if isinstance(cached,dict) and isinstance(cached.get("cards"),dict):
+        out=dict(cached); out["cache_ready"]=True; out["method"]="precomputed_snapshot_fast_path"; out["cache_recorded_at"]=snap.get("recorded_at")
+        return out
+    positions=meta.get("positions") if isinstance(meta.get("positions"),dict) else {}
+    cards={}; total_value=0.0
+    for cid,pos in positions.items():
+        if not isinstance(pos,dict) or pos.get("value") is None: continue
+        value=float(pos.get("value")); cur=pos.get("currency") or snap.get("currency")
+        cards[cid]={"card_id":cid,"current_value":value,"currency":cur,"source":"snapshot_cache","confidence":None,"last_updated":snap.get("recorded_at"),"change_7d_pct":None,"change_30d_pct":None,"history":[],"comp_count":0,"included_comp_count":0,"low":None,"high":None,"reliable":False}
+        total_value += value
+    total_cards=int(snap.get("total_cards") or len(cards))
+    valued=len(cards)
+    return {
+        "status":"valued" if valued else "cache_missing","cache_ready":bool(valued),
+        "cards_considered":total_cards,"valued_cards":valued,"cards_without_comps":max(0,total_cards-valued),
+        "included_comp_count":int(snap.get("included_comp_count") or 0),
+        "coverage_pct":round((valued/total_cards*100),1) if total_cards else 0.0,
+        "estimated_collection_value":round(float(snap.get("value") if snap.get("value") is not None else total_value),2) if valued else None,
+        "currency":snap.get("currency"),"change_7d_pct":None,"change_30d_pct":None,
+        "last_market_update":snap.get("recorded_at"),"cards":cards,
+        "method":"legacy_snapshot_fast_path","cache_recorded_at":snap.get("recorded_at")
+    }
+
 @app.get("/api/v1/collection/market-summary")
 def collection_market_summary():
-    """V0.22.4.8: O(1)-style dashboard load from the latest portfolio snapshot cache.
+    """V0.22.4.9: collection GETs never perform the expensive per-card comp walk.
 
-    Normal collection opening must not walk every card and hundreds of comps.
-    A fresh full summary is calculated only when an explicit market refresh writes
-    a new portfolio snapshot. Existing pre-V0.22.4.8 positioned snapshots are
-    immediately usable as a compatibility cache.
+    If no compatible durable cache exists yet, a one-time background bootstrap is
+    started and this endpoint returns immediately. No SoldComps/provider request is made.
     """
     cached=_cached_market_summary_from_snapshot()
     if cached is not None:
+        cached["cache_ready"]=True
         return cached
-    # One-time legacy fallback for installations that have never written a portfolio snapshot.
-    return _compute_collection_market_summary()
+    _ensure_collection_market_cache_warmup()
+    try:
+        listing=db.list_collection(page=1,page_size=1) or {}
+        total=int(listing.get("total") or 0) if isinstance(listing,dict) else 0
+    except Exception:
+        total=0
+    return {
+        "status":"cache_warming","cache_ready":False,"cache_building":_market_cache_building,
+        "cache_started_at":_market_cache_started_at,"cache_error":_market_cache_error,
+        "cards_considered":total,"valued_cards":0,"cards_without_comps":total,
+        "included_comp_count":0,"coverage_pct":0.0,"estimated_collection_value":None,
+        "currency":None,"last_market_update":None,"cards":{},
+        "method":"background_snapshot_cache_bootstrap",
+        "message":"Marktcache wird einmalig aus bereits gespeicherten Comps aufgebaut. Keine Provider-Abfrage."
+    }
 
 
 def _record_collection_market_snapshot(reason: str = "market_refresh") -> str | None:
