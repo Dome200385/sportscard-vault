@@ -26,7 +26,7 @@ STATIC_INDEX = Path(__file__).resolve().parent.parent / "static" / "index.html"
 
 logger = logging.getLogger("sportscard-vault")
 
-app = FastAPI(title="SportsCard Vault API", version="0.22.4.7", description="Detailed sports-card collection API with editable scan review, correction learning data, transparent comp-based valuation, and an offline-first test UI.")
+app = FastAPI(title="SportsCard Vault API", version="0.22.4.8", description="Detailed sports-card collection API with editable scan review, correction learning data, transparent comp-based valuation, and an offline-first test UI.")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=False, allow_methods=["*"], allow_headers=["*"])
 
 from contextlib import asynccontextmanager
@@ -50,7 +50,7 @@ async def lifespan(app: FastAPI):
 app.router.lifespan_context = lifespan
 
 @app.get("/health")
-def health(): return {"status":"ok","version":"0.22.4.7","environment":settings.app_env,"recognition":settings.recognition_provider,"pricing_provider":settings.price_provider,"database_provider":settings.database_provider}
+def health(): return {"status":"ok","version":"0.22.4.8","environment":settings.app_env,"recognition":settings.recognition_provider,"pricing_provider":settings.price_provider,"database_provider":settings.database_provider}
 
 
 def _serve_test_ui():
@@ -718,9 +718,8 @@ def market_match_preview(payload: dict):
     fp=build_fingerprint(card)
     return {"card_id":card_id,"fingerprint":fp.as_dict(),"match":score_candidate(fp,candidate)}
 
-@app.get("/api/v1/collection/market-summary")
-def collection_market_summary():
-    """Fast persisted market summary for the deferred collection dashboard.
+def _compute_collection_market_summary():
+    """Compute a fresh summary from persisted per-card market data. Used only when a snapshot is created or as a legacy fallback.
 
     V0.22.4.4 intentionally does *not* read per-card price history here.
     Opening the collection only needs each card's already stored comps/current
@@ -806,8 +805,75 @@ def collection_market_summary():
     }
 
 
+def _cached_market_summary_from_snapshot():
+    """Return the newest precomputed summary without touching per-card comps/history."""
+    try:
+        snaps=db.list_collection_market_snapshots(limit=50)
+    except Exception:
+        return None
+    if not snaps:
+        return None
+    latest=snaps[-1]
+    meta=latest.get("metadata") or {}
+    cached=meta.get("market_summary_cache")
+    if isinstance(cached,dict) and isinstance(cached.get("cards"),dict):
+        out=dict(cached)
+        out["method"]="precomputed_collection_snapshot_cache"
+        out["cache_recorded_at"]=latest.get("recorded_at")
+        return out
+
+    # Upgrade path for snapshots written before V0.22.4.8. Positions already contain
+    # the expensive part we need for a fast first paint: per-card values.
+    positions=meta.get("positions")
+    if not isinstance(positions,dict) or not positions:
+        return None
+    cards={}
+    currencies=set()
+    total=0.0
+    for cid,pos in positions.items():
+        if not isinstance(pos,dict) or pos.get("value") is None:
+            continue
+        value=float(pos["value"]); currency=pos.get("currency") or latest.get("currency")
+        cards[cid]={"card_id":cid,"current_value":value,"currency":currency,"source":"snapshot_cache",
+                    "confidence":None,"last_updated":latest.get("recorded_at"),"change_7d_pct":None,"change_30d_pct":None,
+                    "history":[],"comp_count":0,"included_comp_count":0,"low":None,"high":None,"reliable":False}
+        total += value
+        if currency: currencies.add(currency)
+    try:
+        current_total=int((db.list_collection(page=1,page_size=1) or {}).get("total") or latest.get("total_cards") or len(cards))
+    except Exception:
+        current_total=int(latest.get("total_cards") or len(cards))
+    valued=len(cards)
+    currency=latest.get("currency") or (next(iter(currencies)) if len(currencies)==1 else ("MIXED" if currencies else None))
+    return {
+        "cards_considered":current_total,"valued_cards":valued,"cards_without_comps":max(0,current_total-valued),
+        "included_comp_count":int(latest.get("included_comp_count") or 0),
+        "coverage_pct":round((valued/current_total*100),1) if current_total else 0.0,
+        "estimated_collection_value":round(float(latest.get("value") if latest.get("value") is not None else total),2) if valued else None,
+        "currency":currency,"change_7d_pct":None,"change_30d_pct":None,"last_market_update":latest.get("recorded_at"),
+        "cards":cards,"method":"legacy_portfolio_snapshot_cache","status":"valued" if valued else "waiting_for_comps",
+        "cache_recorded_at":latest.get("recorded_at")
+    }
+
+
+@app.get("/api/v1/collection/market-summary")
+def collection_market_summary():
+    """V0.22.4.8: O(1)-style dashboard load from the latest portfolio snapshot cache.
+
+    Normal collection opening must not walk every card and hundreds of comps.
+    A fresh full summary is calculated only when an explicit market refresh writes
+    a new portfolio snapshot. Existing pre-V0.22.4.8 positioned snapshots are
+    immediately usable as a compatibility cache.
+    """
+    cached=_cached_market_summary_from_snapshot()
+    if cached is not None:
+        return cached
+    # One-time legacy fallback for installations that have never written a portfolio snapshot.
+    return _compute_collection_market_summary()
+
+
 def _record_collection_market_snapshot(reason: str = "market_refresh") -> str | None:
-    summary=collection_market_summary()
+    summary=_compute_collection_market_summary()
     value=summary.get("estimated_collection_value")
     currency=summary.get("currency")
     if value is None or not currency or currency == "MIXED":
@@ -821,7 +887,10 @@ def _record_collection_market_snapshot(reason: str = "market_refresh") -> str | 
                 "positions":{
                     cid:{"value":round(float(state.get("current_value")),2),"currency":state.get("currency") or currency}
                     for cid,state in (summary.get("cards") or {}).items() if state.get("current_value") is not None
-                }
+                },
+                # V0.22.4.8: complete precomputed dashboard payload. Normal page loads
+                # read this JSON directly instead of scanning every card and comp.
+                "market_summary_cache":summary
             }
         })
     except Exception:
@@ -954,6 +1023,9 @@ def collection_market_history(limit_per_card: int = Query(5000,ge=1,le=10000)):
         durable=db.list_collection_market_snapshots(limit=20000)
     except Exception:
         durable=[]
+    if durable:
+        points=sorted(({**p,"source":"portfolio_snapshot"} for p in durable if p.get("recorded_at")), key=lambda p:str(p.get("recorded_at")))
+        return {"history":points,"points":len(points),"cards":None,"durable_points":len(points),"method":"durable_portfolio_snapshots_fast_path"}
 
     listing=[]; page=1
     while True:
