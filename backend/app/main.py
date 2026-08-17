@@ -27,7 +27,7 @@ STATIC_INDEX = Path(__file__).resolve().parent.parent / "static" / "index.html"
 
 logger = logging.getLogger("sportscard-vault")
 
-app = FastAPI(title="SportsCard Vault API", version="0.22.6.3", description="Detailed sports-card collection API with editable scan review, correction learning data, transparent comp-based valuation, and an offline-first test UI.")
+app = FastAPI(title="SportsCard Vault API", version="0.22.6.4", description="Detailed sports-card collection API with editable scan review, correction learning data, transparent comp-based valuation, and an offline-first test UI.")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=False, allow_methods=["*"], allow_headers=["*"])
 
 from contextlib import asynccontextmanager
@@ -1234,7 +1234,7 @@ def _persist_defensive_estimates(estimates: dict, estimate_summary: dict, market
 def defensive_collection_estimates():
     """Conservative card-specific estimates for cards without verified comps.
 
-    V0.22.6.3 deliberately has two tiers:
+    V0.22.6.4 uses weighted nearest-neighbour similarity:
     1) semantic peers (same player/product/set) when available;
     2) a low-confidence feature proxy anchored to the lower part of the user's VERIFIED
        collection when exact peers do not exist. This avoids both the old one-price-for-all
@@ -1319,11 +1319,13 @@ def defensive_collection_estimates():
 
         semantic=[p for p in all_candidates if p[0]>=7 and any(r in p[3] for r in ('same_player','same_product','same_set'))]
         semantic.sort(key=lambda x:x[0],reverse=True)
-        basis=''; confidence='niedrig'; peer_count=0
+        basis=''; confidence='niedrig'; peer_count=0; base=defensive_collection_anchor
         if semantic:
             top=semantic[0][0]; band=[p for p in semantic[:8] if p[0]>=top-2.5]
-            base=median([p[1] for p in band])
-            peer_mult=median([card_multiplier(p[2]) for p in band])
+            # Similarity-weighted value: closest verified cards influence the estimate most.
+            weights=[max(.5,p[0])**2 for p in band]
+            base=sum(p[1]*w for p,w in zip(band,weights))/sum(weights)
+            peer_mult=sum(card_multiplier(p[2])*w for p,w in zip(band,weights))/sum(weights)
             ratio=max(.55,min(1.65,card_multiplier(c)/max(.5,peer_mult)))
             estimate=max(.50,base*ratio*.82)
             same_player=sum(1 for p in band if 'same_player' in p[3])
@@ -1331,20 +1333,16 @@ def defensive_collection_estimates():
             basis='same_player' if same_player else ('same_product' if any('same_product' in p[3] for p in band) else 'same_set')
             peer_count=len(band)
         else:
-            # Broader, still card-specific internal proxy. Prefer the closest verified cards
-            # by year/team/feature package; only use collection anchor if there is no useful peer.
             broad=sorted([p for p in all_candidates if p[0]>=2.0], key=lambda x:x[0], reverse=True)[:6]
             if broad:
                 top=broad[0][0]; band=[p for p in broad if p[0]>=max(2.0,top-2.0)]
-                base=median([p[1] for p in band])
-                peer_mult=median([card_multiplier(p[2]) for p in band])
+                weights=[max(.5,p[0])**2 for p in band]
+                base=sum(p[1]*w for p,w in zip(band,weights))/sum(weights)
+                peer_mult=sum(card_multiplier(p[2])*w for p,w in zip(band,weights))/sum(weights)
                 ratio=max(.62,min(1.48,card_multiplier(c)/max(.5,peer_mult)))
-                # Stronger haircut because these are only structural peers.
                 estimate=max(.50,base*ratio*.68)
-                basis='feature_peer_proxy'; peer_count=len(band)
+                basis='weighted_feature_peers'; peer_count=len(band)
             else:
-                # Final low-confidence fallback is anchored to the LOWER HALF of real prices,
-                # then individualized by the target card's own rookie/auto/relic/rarity package.
                 ratio=max(.62,min(1.55,card_multiplier(c)/max(.5,valued_mult_anchor)))
                 estimate=max(.50,defensive_collection_anchor*ratio*.72)
                 basis='verified_collection_feature_proxy'; peer_count=0
@@ -1359,9 +1357,9 @@ def defensive_collection_estimates():
         fresh.append({
             "card_id":row['card_id'],"estimate":round(estimate,2),"low":round(low,2),"high":round(high,2),
             "currency":summary.get('currency') or 'USD',"confidence":confidence,"basis":basis,
-            "peer_count":peer_count,"anchor_value":round(base if 'base' in locals() else defensive_collection_anchor,2),
+            "peer_count":peer_count,"anchor_value":round(base,2),
             "feature_ratio":round(ratio,3),"estimated_at":datetime.now(timezone.utc).isoformat(),
-            "method":"card_specific_defensive_similarity_v3"
+            "method":"weighted_card_similarity_v4"
         })
 
     fresh_map={x['card_id']:x for x in fresh}
@@ -1381,7 +1379,7 @@ def defensive_collection_estimates():
         "status":"estimated","verified_total":round(verified,2),"estimated_missing_mid":round(est_sum,2),
         "combined_mid":round(verified+est_sum,2),"combined_low":round(verified+low_sum,2),"combined_high":round(verified+high_sum,2),
         "currency":summary.get('currency') or 'USD',"estimated_cards":len(vals),
-        "unresolved_cards":max(0,len(missing)-len(vals)),"method":"card_specific_defensive_similarity_v3",
+        "unresolved_cards":max(0,len(missing)-len(vals)),"method":"weighted_card_similarity_v4",
         "message":f"{len(fresh)} kartenspezifische defensive Schätzungen berechnet; {len(vals)} defensive Werte persistent gespeichert. Verifizierte Marktwerte bleiben unverändert."
     }
     try:
