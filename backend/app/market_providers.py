@@ -119,6 +119,41 @@ class MarketFingerprint:
             parts.extend([self.grading_company, self.grade_numeric])
         return " ".join(str(x) for x in parts if x not in (None, ""))
 
+    def soldcomps_fallback_query(self) -> str:
+        """Broader discovery query for scarce cards.
+
+        Used only after the normal exact SoldComps search produced no acceptable
+        verified comps. Identity is still enforced locally before any sale can
+        enter a valuation.
+        """
+        parts: list[Any] = []
+        product = self.product_line or self.set_name
+        if product:
+            parts.append(product)
+        elif self.manufacturer:
+            parts.append(self.manufacturer)
+        if self.subject:
+            parts.append(self.subject)
+        if self.card_number:
+            parts.append(self.card_number)
+        elif self.release_year:
+            parts.append(self.release_year)
+        if self.serial_print_run:
+            parts.append(f"/{self.serial_print_run}")
+        if self.raw_or_graded == "graded" and self.grading_company:
+            parts.extend([self.grading_company, self.grade_numeric])
+        return " ".join(str(x) for x in parts if x not in (None, ""))
+
+    def soldcomps_queries(self) -> list[dict[str, Any]]:
+        primary = self.soldcomps_query().strip()
+        fallback = self.soldcomps_fallback_query().strip()
+        out: list[dict[str, Any]] = []
+        if primary:
+            out.append({"query": primary, "exact_match": True, "strategy": "primary_exact"})
+        if fallback:
+            out.append({"query": fallback, "exact_match": False, "strategy": "fallback_broad"})
+        return out
+
     def as_dict(self) -> dict[str, Any]:
         d = asdict(self)
         d["query_text"] = self.query_text()
@@ -268,8 +303,26 @@ def score_sold_listing(fp: MarketFingerprint, item: dict[str, Any]) -> dict[str,
     manufacturer_score = _token_coverage(fp.manufacturer, title)
     insert_score = _token_coverage(fp.insert_name, title, ignore=ignore) if fp.insert_name else 1.0
     parallel_score = _token_coverage(fp.parallel_name, title, ignore=ignore) if fp.parallel_name else 1.0
+
+    serial_score = 1.0
+    if fp.serial_print_run:
+        n = int(fp.serial_print_run)
+        raw_title = str(title).lower()
+        serial_hit = bool(
+            re.search(rf"\b\d+\s*/\s*0*{n}\b", raw_title)
+            or re.search(rf"(?<!\d)/\s*0*{n}\b", raw_title)
+            or re.search(rf"\bof\s+0*{n}\b", raw_title)
+        )
+        serial_score = 1.0 if serial_hit else 0.0
+
     if fp.parallel_name and parallel_score < 0.99:
-        hard.append("parallel_name")
+        serial_identity_override = bool(
+            fp.serial_print_run and serial_score == 1.0 and subject_score >= 0.99 and card_score == 1.0
+        )
+        if serial_identity_override:
+            parallel_score = max(parallel_score, 0.75)
+        else:
+            hard.append("parallel_name")
 
     # Release year is useful but not hard: sellers frequently write 2025-26 while
     # the card copyright/release field is 2026.
@@ -293,6 +346,7 @@ def score_sold_listing(fp: MarketFingerprint, item: dict[str, Any]) -> dict[str,
         {"field": "manufacturer", "score": round(manufacturer_score, 3)},
         {"field": "insert_name", "score": round(insert_score, 3)},
         {"field": "parallel_name", "score": round(parallel_score, 3)},
+        {"field": "serial_print_run", "score": round(serial_score, 3)},
         {"field": "release_year", "score": round(year_score, 3)},
         {"field": "traits", "score": round(traits, 3)},
     ]
@@ -321,10 +375,10 @@ class SoldCompsError(RuntimeError):
         self.code = code
 
 
-def soldcomps_search(fp: MarketFingerprint) -> dict[str, Any]:
+def soldcomps_search(fp: MarketFingerprint, *, query_override: str | None = None, exact_match: bool = True) -> dict[str, Any]:
     if not settings.soldcomps_api_key:
         raise SoldCompsError("SOLDCOMPS_API_KEY is not configured")
-    query = fp.soldcomps_query().strip()
+    query = (query_override or fp.soldcomps_query()).strip()
     if not fp.subject or not (fp.product_line or fp.set_name) or not query:
         raise SoldCompsError("Fingerprint is too incomplete for an automatic sold-comps search")
     params: dict[str, Any] = {
@@ -334,7 +388,7 @@ def soldcomps_search(fp: MarketFingerprint) -> dict[str, Any]:
         "ebaySite": settings.soldcomps_ebay_site,
         "sortOrder": "endedRecently",
         "sold": "true",
-        "exactMatch": "true",
+        "exactMatch": "true" if exact_match else "false",
         "includeCompleteListing": "true",
         "soldAfter": (date.today() - timedelta(days=settings.soldcomps_days)).isoformat(),
     }
@@ -363,6 +417,7 @@ def soldcomps_search(fp: MarketFingerprint) -> dict[str, Any]:
         "has_next_page": bool(data.get("hasNextPage")),
         "ebay_site": settings.soldcomps_ebay_site,
         "sold_after": params["soldAfter"],
+        "exact_match": exact_match,
     }
 
 

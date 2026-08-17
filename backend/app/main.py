@@ -27,7 +27,7 @@ STATIC_INDEX = Path(__file__).resolve().parent.parent / "static" / "index.html"
 
 logger = logging.getLogger("sportscard-vault")
 
-app = FastAPI(title="SportsCard Vault API", version="0.22.4.12", description="Detailed sports-card collection API with editable scan review, correction learning data, transparent comp-based valuation, and an offline-first test UI.")
+app = FastAPI(title="SportsCard Vault API", version="0.22.5", description="Detailed sports-card collection API with editable scan review, correction learning data, transparent comp-based valuation, and an offline-first test UI.")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=False, allow_methods=["*"], allow_headers=["*"])
 
 from contextlib import asynccontextmanager
@@ -57,7 +57,7 @@ async def lifespan(app: FastAPI):
 app.router.lifespan_context = lifespan
 
 @app.get("/health")
-def health(): return {"status":"ok","version":"0.22.4.12","environment":settings.app_env,"recognition":settings.recognition_provider,"pricing_provider":settings.price_provider,"database_provider":settings.database_provider}
+def health(): return {"status":"ok","version":"0.22.5","environment":settings.app_env,"recognition":settings.recognition_provider,"pricing_provider":settings.price_provider,"database_provider":settings.database_provider}
 
 
 def _serve_test_ui():
@@ -1046,6 +1046,124 @@ def create_collection_performance_baseline():
     if not sid:
         return {"status":"not_available","snapshot_id":None,"message":"Noch kein vollständig bewertbarer Sammlungswert vorhanden."}
     return {"status":"created","snapshot_id":sid,"message":"Performance-Basis gespeichert; künftige Zugänge/Abgänge werden getrennt von Marktbewegungen ausgewiesen."}
+
+
+@app.post("/api/v1/collection/market/coverage-refresh")
+def refresh_collection_market_coverage(max_requests: int = Query(20, ge=1, le=50)):
+    """Second-pass SoldComps discovery for cards that still have no market value.
+
+    V0.22.5 deliberately does not invent prices and does not touch already-valued
+    cards. It uses a broader provider query only to discover candidate sold listings;
+    every result must still pass the strict local identity matcher before being
+    persisted as a verified comp. This keeps the operation quota-conscious.
+    """
+    if not settings.soldcomps_api_key:
+        return {
+            "status":"provider_not_configured","cards_without_value":0,"provider_requests_used":0,
+            "message":"SoldComps ist nicht konfiguriert. Es wurden keine Preise erfunden."
+        }
+
+    summary=_compute_collection_market_summary()
+    states=summary.get("cards") or {}
+    unresolved=[cid for cid,state in states.items() if state.get("current_value") is None]
+
+    if not unresolved:
+        return {
+            "status":"already_complete","cards_without_value":0,"cards_recovered":0,
+            "provider_requests_used":0,"new_verified_comps":0,
+            "message":"Alle Karten mit vorhandenen Marktdaten sind bereits bewertet."
+        }
+
+    # Group identical fallback searches so duplicate/closely related holdings consume
+    # one provider request. A broad provider search is safe because ingestion still
+    # performs exact player/card/parallel/grade checks locally.
+    groups: dict[str, list[tuple[str, dict, dict]]] = {}
+    skipped=[]
+    for cid in unresolved:
+        card=db.get_card(cid)
+        if not card:
+            skipped.append({"card_id":cid,"reason":"card_not_found"})
+            continue
+        fp=build_fingerprint(card)
+        strategies=fp.soldcomps_queries()
+        fallback=next((x for x in strategies if x.get("strategy")=="fallback_broad"),None)
+        if not fallback or not fallback.get("query"):
+            skipped.append({"card_id":cid,"reason":"insufficient_fingerprint"})
+            continue
+        groups.setdefault(fallback["query"],[]).append((cid,card,fallback))
+
+    selected_queries=list(groups.keys())[:max_requests]
+    deferred_queries=list(groups.keys())[max_requests:]
+    search_cache: dict[str,dict]={}; search_errors: dict[str,dict]={}
+    max_workers=max(1,min(4,len(selected_queries)))
+
+    def _coverage_search(query: str):
+        cid,card,strategy=groups[query][0]
+        fp=build_fingerprint(card)
+        return soldcomps_search(fp,query_override=query,exact_match=False)
+
+    if selected_queries:
+        with ThreadPoolExecutor(max_workers=max_workers,thread_name_prefix="coverage-soldcomps") as pool:
+            futures={pool.submit(_coverage_search,q):q for q in selected_queries}
+            for fut in as_completed(futures):
+                q=futures[fut]
+                try: search_cache[q]=fut.result()
+                except SoldCompsError as exc:
+                    search_errors[q]={"http_status":exc.status_code,"code":exc.code,"message":str(exc)}
+                except Exception as exc:
+                    search_errors[q]={"message":f"{type(exc).__name__}: {exc}"}
+
+    recovered=0; new_comps=0; details=[]; errors=[]
+    for query in selected_queries:
+        rows=groups[query]
+        if query in search_errors:
+            for cid,_card,_strategy in rows:
+                errors.append({"card_id":cid,"query":query,**search_errors[query]})
+            continue
+        provider_result=search_cache.get(query)
+        if not provider_result:
+            continue
+        for cid,card,strategy in rows:
+            try:
+                before=_card_market_state(cid).get("current_value")
+                result=_ingest_soldcomps_search(cid,card,provider_result)
+                after=result.get("current_market",{}).get("current_value")
+                if before is None and after is not None:
+                    recovered += 1
+                new_comps += result.get("new_comps") or 0
+                details.append({
+                    "card_id":cid,"strategy":"fallback_broad","query":query,
+                    "raw_results":result.get("raw_results") or 0,
+                    "identity_matches":result.get("identity_matches") or 0,
+                    "included_matches":result.get("included_matches") or 0,
+                    "new_comps":result.get("new_comps") or 0,
+                    "recovered":bool(before is None and after is not None),
+                })
+            except Exception as exc:
+                errors.append({"card_id":cid,"query":query,"message":f"{type(exc).__name__}: {exc}"})
+
+    snapshot_id=_record_collection_market_snapshot("coverage_refresh")
+    after_summary=_compute_collection_market_summary()
+    remaining=max(0,(after_summary.get("cards_considered") or 0)-(after_summary.get("valued_cards") or 0))
+    status="updated" if recovered or new_comps else ("partial" if errors else "no_new_matches")
+    return {
+        "status":status,
+        "cards_without_value_before":len(unresolved),
+        "cards_recovered":recovered,
+        "cards_without_value_after":remaining,
+        "provider_requests_used":len(selected_queries),
+        "request_budget":max_requests,
+        "deferred_query_groups":len(deferred_queries),
+        "new_verified_comps":new_comps,
+        "collection_snapshot_id":snapshot_id,
+        "errors":errors,"skipped":skipped,"details":details,
+        "message":(
+            f"Abdeckungs-Suche: {len(selected_queries)} zusätzliche SoldComps-Abfragen, "
+            f"{recovered} Karten neu bewertet, {new_comps} neue verifizierte Comps. "
+            f"{remaining} Karten bleiben ohne Marktwert."
+        ),
+    }
+
 
 @app.post("/api/v1/collection/market/refresh")
 def refresh_collection_market():
