@@ -1234,7 +1234,7 @@ def _persist_defensive_estimates(estimates: dict, estimate_summary: dict, market
 def defensive_collection_estimates():
     """Conservative estimates only when a card has a defensible verified peer basis.
 
-    V0.22.6.5 fixes the identical-price bug: false/absent boolean features no longer
+    V0.22.6.6 adds transparent peer diagnostics while preserving the V0.22.6.5 evidence rules: false/absent boolean features no longer
     create similarity. Text identity, parallel, numbering and positive card traits are
     weighted; weak peers are rejected instead of falling back to a collection-wide price.
     """
@@ -1316,7 +1316,7 @@ def defensive_collection_estimates():
         c=row['card']; candidates=[]
         for v in valued:
             sc,rs=similarity(c,v['card'])
-            candidates.append((sc,float(v['value']),v['card'],rs))
+            candidates.append((sc,float(v['value']),v['card'],rs,v['card_id']))
         candidates.sort(key=lambda x:x[0],reverse=True)
         # A defensible peer needs real semantic identity, not generic shared absence/features.
         semantic=[p for p in candidates if p[0]>=6.0 and any(r in p[3] for r in ('same_player','same_product','same_set'))]
@@ -1336,13 +1336,29 @@ def defensive_collection_estimates():
         estimate=min(estimate,cap)
         low=max(.50,estimate*(1-spread));high=estimate*(1+spread)
         basis='same_player' if same_player else ('same_product' if any('same_product' in p[3] for p in band) else 'same_set')
+        peer_diagnostics=[]
+        for p in candidates[:5]:
+            pc=p[2] or {}
+            peer_diagnostics.append({
+                "card_id":p[4],
+                "player":pc.get('primary_subject_name'),
+                "product_line":pc.get('product_line'),
+                "set_name":pc.get('set_name'),
+                "card_number":pc.get('card_number_printed') or pc.get('card_number_normalized'),
+                "value":round(float(p[1]),2),
+                "score":round(float(p[0]),2),
+                "reasons":list(p[3] or []),
+                "accepted":p in band,
+                "multiplier":round(card_multiplier(pc),3),
+            })
         fresh.append({"card_id":row['card_id'],"estimate":round(estimate,2),"low":round(low,2),"high":round(high,2),
             "currency":summary.get('currency') or 'USD',"confidence":confidence,"basis":basis,"peer_count":len(band),
             "anchor_value":round(base,2),"feature_ratio":round(ratio,3),"similarity_score":round(top,2),
-            "estimated_at":datetime.now(timezone.utc).isoformat(),"method":"weighted_card_similarity_v5"})
+            "target_multiplier":round(card_multiplier(c),3),"peer_diagnostics":peer_diagnostics,
+            "estimated_at":datetime.now(timezone.utc).isoformat(),"method":"weighted_card_similarity_v6_diagnostic"})
 
     fresh_map={x['card_id']:x for x in fresh}
-    merged={cid:est for cid,est in (previous or {}).items() if isinstance(est,dict) and est.get('method')=='weighted_card_similarity_v5'}
+    merged={cid:est for cid,est in (previous or {}).items() if isinstance(est,dict) and est.get('method')=='weighted_card_similarity_v6_diagnostic'}
     merged.update(fresh_map)
     for cid,state in states.items():
         if state.get('current_value') is not None: merged.pop(cid,None)
@@ -1354,8 +1370,8 @@ def defensive_collection_estimates():
     verified=float(summary.get('estimated_collection_value') or 0)
     estimate_summary={"status":"estimated" if vals else "insufficient_peer_basis","verified_total":round(verified,2),
         "estimated_missing_mid":round(est_sum,2),"combined_mid":round(verified+est_sum,2),"combined_low":round(verified+low_sum,2),"combined_high":round(verified+high_sum,2),
-        "currency":summary.get('currency') or 'USD',"estimated_cards":len(vals),"unresolved_cards":len(unresolved),"method":"weighted_card_similarity_v5",
-        "message":f"{len(fresh)} kartenspezifische defensive Schätzungen berechnet; {len(unresolved)} Karten ohne belastbare Peer-Basis bewusst ungeschätzt."}
+        "currency":summary.get('currency') or 'USD',"estimated_cards":len(vals),"unresolved_cards":len(unresolved),"method":"weighted_card_similarity_v6_diagnostic",
+        "message":f"{len(fresh)} Schätzungen mit Peer-Diagnose berechnet; {len(unresolved)} Karten ohne belastbare Peer-Basis bewusst ungeschätzt."}
     try:snapshot_id=_persist_defensive_estimates(merged,estimate_summary,summary)
     except Exception as exc:
         logger.exception("defensive estimate persistence failed");raise HTTPException(500,f"Defensive estimate persist failed: {type(exc).__name__}: {exc}")
