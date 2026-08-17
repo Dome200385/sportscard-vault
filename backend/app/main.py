@@ -27,7 +27,7 @@ STATIC_INDEX = Path(__file__).resolve().parent.parent / "static" / "index.html"
 
 logger = logging.getLogger("sportscard-vault")
 
-app = FastAPI(title="SportsCard Vault API", version="0.22.4.9", description="Detailed sports-card collection API with editable scan review, correction learning data, transparent comp-based valuation, and an offline-first test UI.")
+app = FastAPI(title="SportsCard Vault API", version="0.22.4.12", description="Detailed sports-card collection API with editable scan review, correction learning data, transparent comp-based valuation, and an offline-first test UI.")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=False, allow_methods=["*"], allow_headers=["*"])
 
 from contextlib import asynccontextmanager
@@ -45,7 +45,7 @@ async def lifespan(app: FastAPI):
             db.activate_sqlite_fallback(f"Startup DB error: {type(exc).__name__}: {exc}")
         except Exception:
             logger.exception("sqlite fallback initialization also failed")
-    # V0.22.4.9: warm a missing legacy market cache in the background after deploy.
+    # V0.22.4.12: warm a missing legacy market cache in the background after deploy.
     # The service remains responsive while this one-time persisted-comp calculation runs.
     try:
         _ensure_collection_market_cache_warmup()
@@ -57,7 +57,7 @@ async def lifespan(app: FastAPI):
 app.router.lifespan_context = lifespan
 
 @app.get("/health")
-def health(): return {"status":"ok","version":"0.22.4.9","environment":settings.app_env,"recognition":settings.recognition_provider,"pricing_provider":settings.price_provider,"database_provider":settings.database_provider}
+def health(): return {"status":"ok","version":"0.22.4.12","environment":settings.app_env,"recognition":settings.recognition_provider,"pricing_provider":settings.price_provider,"database_provider":settings.database_provider}
 
 
 def _serve_test_ui():
@@ -815,7 +815,7 @@ def _compute_collection_market_summary():
 def _cached_market_summary_from_snapshot():
     """Return the newest usable precomputed/positioned summary without per-card reads.
 
-    V0.22.4.9 no longer assumes a database-specific ordering for snapshot lists.
+    V0.22.4.12 no longer assumes a database-specific ordering for snapshot lists.
     It scans newest-first for a full cache, then newest-first for a legacy positioned
     snapshot. This lets existing V0.22.x snapshots become instant caches immediately.
     """
@@ -919,7 +919,7 @@ def _ensure_collection_market_cache_warmup() -> bool:
 
 @app.get("/api/v1/collection/market-cache")
 def collection_market_cache():
-    """V0.22.4.11: instant, strictly read-only collection market cache.
+    """V0.22.4.12: instant, strictly read-only collection market cache.
 
     Normal collection opens never calculate market values, walk card comps, start a
     background job, or call SoldComps/providers. The endpoint only reads an already
@@ -997,7 +997,7 @@ def rebuild_collection_market_cache():
 def collection_market_summary():
     """Compatibility alias for the instant persisted cache.
 
-    V0.22.4.11 deliberately performs no calculation on GET. Older frontends can call
+    V0.22.4.12 deliberately performs no calculation on GET. Older frontends can call
     this route safely without triggering a collection-wide comp scan.
     """
     return collection_market_cache()
@@ -1019,7 +1019,7 @@ def _record_collection_market_snapshot(reason: str = "market_refresh") -> str | 
                     cid:{"value":round(float(state.get("current_value")),2),"currency":state.get("currency") or currency}
                     for cid,state in (summary.get("cards") or {}).items() if state.get("current_value") is not None
                 },
-                # V0.22.4.11: complete precomputed dashboard payload. Normal page loads
+                # V0.22.4.12: complete precomputed dashboard payload. Normal page loads
                 # read this JSON directly instead of scanning every card and comp.
                 "market_summary_cache":summary
             }
