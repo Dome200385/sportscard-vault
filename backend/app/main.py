@@ -27,7 +27,7 @@ STATIC_INDEX = Path(__file__).resolve().parent.parent / "static" / "index.html"
 
 logger = logging.getLogger("sportscard-vault")
 
-app = FastAPI(title="SportsCard Vault API", version="0.22.6.7", description="Detailed sports-card collection API with editable scan review, correction learning data, transparent comp-based valuation, and an offline-first test UI.")
+app = FastAPI(title="SportsCard Vault API", version="0.22.6.8", description="Detailed sports-card collection API with editable scan review, correction learning data, transparent comp-based valuation, and an offline-first test UI.")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=False, allow_methods=["*"], allow_headers=["*"])
 
 from contextlib import asynccontextmanager
@@ -57,7 +57,7 @@ async def lifespan(app: FastAPI):
 app.router.lifespan_context = lifespan
 
 @app.get("/health")
-def health(): return {"status":"ok","version":"0.22.6.7","environment":settings.app_env,"recognition":settings.recognition_provider,"pricing_provider":settings.price_provider,"database_provider":settings.database_provider}
+def health(): return {"status":"ok","version":"0.22.6.8","environment":settings.app_env,"recognition":settings.recognition_provider,"pricing_provider":settings.price_provider,"database_provider":settings.database_provider}
 
 
 def _serve_test_ui():
@@ -1234,7 +1234,7 @@ def _persist_defensive_estimates(estimates: dict, estimate_summary: dict, market
 def defensive_collection_estimates():
     """Conservative, card-specific estimates for cards without verified market value.
 
-    V0.22.6.7 uses a hybrid evidence model:
+    V0.22.6.8 fixes card-specific feature hydration before running the hybrid evidence model:
     1) exact/near verified peers when available,
     2) category anchors (same player/product/set/team/year),
     3) a defensive collection quantile only as last-resort anchor,
@@ -1244,9 +1244,33 @@ def defensive_collection_estimates():
     """
     summary=_compute_collection_market_summary()
     states=summary.get("cards") or {}
+
+    # V0.22.6.8: hydrate recognition fields from the collection row as well as get_card().
+    # Some DB providers return a narrower get_card payload; that made different cards
+    # appear featureless and inherit the same defensive anchor and estimate.
+    collection_items={}
+    page=1; page_size=200
+    while True:
+        listing=db.list_collection(page=page,page_size=page_size)
+        batch=listing.get("items",[]) if isinstance(listing,dict) else []
+        for item in batch:
+            cid=item.get("id") or item.get("card_identity_id")
+            if cid: collection_items[cid]=item
+        if len(batch)<page_size: break
+        page+=1
+        if page>100: break
+
+    def hydrated_card(cid):
+        base=dict(collection_items.get(cid) or {})
+        detail=db.get_card(cid) or {}
+        for key,value in detail.items():
+            if value not in (None,'',[],{}): base[key]=value
+            elif key not in base: base[key]=value
+        return base
+
     valued=[]; missing=[]
     for cid,state in states.items():
-        card=db.get_card(cid) or {}
+        card=hydrated_card(cid)
         row={"card_id":cid,"card":card,"value":state.get("current_value"),"currency":state.get("currency")}
         (valued if state.get("current_value") is not None else missing).append(row)
     if not valued:
@@ -1412,7 +1436,7 @@ def defensive_collection_estimates():
             'anchor_value':round(anchor,2),'feature_multiplier':round(fm,3),'feature_breakdown':feature_parts,
             'similarity_score':round(float(sim_score),2),'peer_diagnostics':peer_diag,
             'anchor_groups':[{'basis':g[2],'value':round(float(g[0]),2),'count':g[3]} for g in anchor_groups],
-            'estimated_at':datetime.now(timezone.utc).isoformat(),'method':'hybrid_feature_model_v7'})
+            'estimated_at':datetime.now(timezone.utc).isoformat(),'method':'hybrid_feature_model_v8'})
 
     fresh_map={x['card_id']:x for x in fresh}
     # v7 intentionally replaces stale defensive model versions for still-unverified cards.
@@ -1424,7 +1448,7 @@ def defensive_collection_estimates():
     verified=float(summary.get('estimated_collection_value') or 0)
     estimate_summary={'status':'estimated' if vals else 'insufficient_peer_basis','verified_total':round(verified,2),
         'estimated_missing_mid':round(est_sum,2),'combined_mid':round(verified+est_sum,2),'combined_low':round(verified+low_sum,2),'combined_high':round(verified+high_sum,2),
-        'currency':summary.get('currency') or 'USD','estimated_cards':len(vals),'unresolved_cards':len(unresolved),'method':'hybrid_feature_model_v7',
+        'currency':summary.get('currency') or 'USD','estimated_cards':len(vals),'unresolved_cards':len(unresolved),'method':'hybrid_feature_model_v8',
         'message':f'{len(fresh)} kartenspezifische defensive Schätzungen berechnet. Verified SoldComps bleiben immer vorrangig.'}
     try:snapshot_id=_persist_defensive_estimates(merged,estimate_summary,summary)
     except Exception as exc:
