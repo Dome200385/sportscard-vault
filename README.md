@@ -1,18 +1,13 @@
-# SportsCard Vault V0.8
+# Backend V0.1
 
-Scan-first Sports-Card-Collection-App für detaillierte Erfassung großer Sammlungen.
-
-## Testfokus dieser Version
-Vorder- und Rückseite fotografieren → automatische Vision-Analyse → detaillierte Felder mit Confidence → nur Unsicherheiten korrigieren → speichern.
-
-## Deployment
-Siehe `DEPLOY_RENDER.md`.
-
-## Backend-Tests
+## Local start
 ```bash
-cd backend
+python -m venv .venv
+# Windows: .venv\\Scripts\\activate
+# macOS/Linux: source .venv/bin/activate
 pip install -r requirements.txt
-PYTHONPATH=. python -m pytest -q
+uvicorn app.main:app --reload
 ```
+Open `http://127.0.0.1:8000/docs`.
 
-Aktueller Stand: **10/10 Tests bestanden**.
+V0.1 is intentionally safe: image upload works, but the recognition adapter does **not** guess unseen card details yet. Locked Fast-Scan context is trusted; unknown critical fields are returned for confirmation. This prevents the LUDEX-style failure mode while the real recognition adapter is implemented.
