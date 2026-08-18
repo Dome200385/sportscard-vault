@@ -27,7 +27,7 @@ STATIC_INDEX = Path(__file__).resolve().parent.parent / "static" / "index.html"
 
 logger = logging.getLogger("sportscard-vault")
 
-app = FastAPI(title="SportsCard Vault API", version="0.22.7.0", description="Detailed sports-card collection API with editable scan review, correction learning data, transparent comp-based valuation, and an offline-first test UI.")
+app = FastAPI(title="SportsCard Vault API", version="0.22.7.1", description="Detailed sports-card collection API with editable scan review, correction learning data, transparent comp-based valuation, and an offline-first test UI.")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=False, allow_methods=["*"], allow_headers=["*"])
 
 from contextlib import asynccontextmanager
@@ -57,7 +57,7 @@ async def lifespan(app: FastAPI):
 app.router.lifespan_context = lifespan
 
 @app.get("/health")
-def health(): return {"status":"ok","version":"0.22.7.0","environment":settings.app_env,"recognition":settings.recognition_provider,"pricing_provider":settings.price_provider,"database_provider":settings.database_provider}
+def health(): return {"status":"ok","version":"0.22.7.1","environment":settings.app_env,"recognition":settings.recognition_provider,"pricing_provider":settings.price_provider,"database_provider":settings.database_provider}
 
 
 def _serve_test_ui():
@@ -1234,7 +1234,7 @@ def _persist_defensive_estimates(estimates: dict, estimate_summary: dict, market
 def defensive_collection_estimates():
     """Conservative, card-specific estimates for cards without verified market value.
 
-    V0.22.7.0 removes the shared hard ceiling that caused distinct cards to collapse to the same defensive price. The hybrid model now uses card-specific adaptive compression:
+    V0.22.7.1 calibrates high-uncertainty model outputs after V0.22.7.0 removed the shared hard ceiling that caused distinct cards to collapse to the same defensive price. The hybrid model now uses card-specific adaptive compression:
     1) exact/near verified peers when available,
     2) category anchors (same player/product/set/team/year),
     3) a defensive collection quantile only as last-resort anchor,
@@ -1393,6 +1393,44 @@ def defensive_collection_estimates():
         broad_cap=max(25.0,global_med*4.0,q(valued_values,.80)*2.0)
         return min(compressed,broad_cap), evidence, True
 
+    def calibrate_defensive_estimate(estimate, c, anchor, basis, sim_score, peer_count, feature_parts):
+        """Evidence-aware final calibration for defensive estimates.
+
+        The adaptive model deliberately differentiates cards, but weak soft peers can still
+        amplify an anchor many-fold. Calibration preserves card-specific differences while
+        requiring stronger evidence for large premiums. It never touches verified values.
+        """
+        est=max(.50,float(estimate or 0))
+        anc=max(.50,float(anchor or global_q30 or .50))
+        sim=max(0.0,float(sim_score or 0))
+        nfeat=len(feature_parts or [])
+        empirical=sum(1 for x in (feature_parts or []) if x.get('source')=='empirical')
+        scarcity=any(x.get('feature')=='print_run' for x in (feature_parts or []))
+
+        if basis=='verified_peer_blend':
+            evidence=.58 + min(.20,sim/60.0) + min(.12,float(peer_count or 0)*.035) + min(.08,empirical*.03)
+            max_ratio=3.45 + min(.75,sim*.045) + min(.45,nfeat*.09) + (.25 if scarcity else 0)
+            retain=.34
+        elif basis=='soft_peer_feature_blend':
+            evidence=.27 + min(.20,sim/24.0) + min(.10,float(peer_count or 0)*.018) + min(.12,nfeat*.025) + min(.08,empirical*.03)
+            max_ratio=2.05 + min(.85,sim*.14) + min(.55,nfeat*.11) + min(.30,empirical*.10) + (.30 if scarcity else 0)
+            retain=.18
+        else:
+            evidence=.16 + min(.10,sim/30.0) + min(.14,nfeat*.028) + min(.08,empirical*.03)
+            max_ratio=1.85 + min(.55,nfeat*.11) + min(.25,empirical*.10) + (.25 if scarcity else 0)
+            retain=.12
+
+        evidence=max(.05,min(.95,evidence))
+        max_ratio=max(1.35,min(4.75,max_ratio))
+        limit=anc*max_ratio
+        calibrated=est if est<=limit else limit+(est-limit)*retain
+
+        # Broad portfolio guardrail is intentionally loose: it catches runaway outputs only.
+        broad=max(30.0,q(valued_values,.80)*2.35,global_med*3.2)
+        calibrated=min(calibrated,broad)
+        label='hoch' if evidence>=.74 else ('mittel' if evidence>=.50 else 'niedrig')
+        return max(.50,calibrated), round(evidence,3), label, limit, est>limit
+
     def category_anchor(c):
         # Blend only evidence actually present in the verified collection.
         groups=[]
@@ -1471,16 +1509,22 @@ def defensive_collection_estimates():
                 sim_score=candidates[0][0] if candidates else 0
 
         estimate=max(.50,estimate)
-        spread=.28 if confidence=='mittel' else .42
+        pre_calibration_estimate=float(estimate)
+        estimate,evidence_score,confidence,calibration_limit,calibration_applied=calibrate_defensive_estimate(
+            estimate,c,anchor,basis,sim_score,peer_count,feature_parts)
+        # Uncertainty band follows actual evidence rather than only the peer branch.
+        spread=.22 if evidence_score>=.74 else (.30 if evidence_score>=.50 else .38)
         low=max(.50,estimate*(1-spread));high=estimate*(1+spread)
         fresh.append({'card_id':row['card_id'],'estimate':round(estimate,2),'low':round(low,2),'high':round(high,2),
             'currency':summary.get('currency') or 'USD','confidence':confidence,'basis':basis,'peer_count':peer_count,
             'anchor_value':round(anchor,2),'feature_multiplier':round(fm,3),'feature_breakdown':feature_parts,
             'raw_estimate':round(float(raw_estimate),2) if 'raw_estimate' in locals() else round(float(estimate),2),
             'adaptive_limit':round(float(adaptive_limit),2) if adaptive_limit is not None else None,'compressed':bool(was_compressed),
+            'pre_calibration_estimate':round(pre_calibration_estimate,2),'calibration_limit':round(float(calibration_limit),2),
+            'calibration_applied':bool(calibration_applied),'confidence_score':round(float(evidence_score),3),
             'similarity_score':round(float(sim_score),2),'peer_diagnostics':peer_diag,
             'anchor_groups':[{'basis':g[2],'value':round(float(g[0]),2),'count':g[3]} for g in anchor_groups],
-            'estimated_at':datetime.now(timezone.utc).isoformat(),'method':'card_specific_adaptive_model_v10'})
+            'estimated_at':datetime.now(timezone.utc).isoformat(),'method':'evidence_calibrated_adaptive_model_v11'})
 
     fresh_map={x['card_id']:x for x in fresh}
     # v7 intentionally replaces stale defensive model versions for still-unverified cards.
@@ -1492,8 +1536,8 @@ def defensive_collection_estimates():
     verified=float(summary.get('estimated_collection_value') or 0)
     estimate_summary={'status':'estimated' if vals else 'insufficient_peer_basis','verified_total':round(verified,2),
         'estimated_missing_mid':round(est_sum,2),'combined_mid':round(verified+est_sum,2),'combined_low':round(verified+low_sum,2),'combined_high':round(verified+high_sum,2),
-        'currency':summary.get('currency') or 'USD','estimated_cards':len(vals),'unresolved_cards':len(unresolved),'method':'card_specific_adaptive_model_v10',
-        'message':f'{len(fresh)} kartenspezifische defensive Schätzungen berechnet. Verified SoldComps bleiben immer vorrangig.'}
+        'currency':summary.get('currency') or 'USD','estimated_cards':len(vals),'unresolved_cards':len(unresolved),'method':'evidence_calibrated_adaptive_model_v11',
+        'message':f'{len(fresh)} kartenspezifische defensive Schätzungen evidenzbasiert kalibriert. Verified SoldComps bleiben immer vorrangig.'}
     try:snapshot_id=_persist_defensive_estimates(merged,estimate_summary,summary)
     except Exception as exc:
         logger.exception('defensive estimate persistence failed');raise HTTPException(500,f'Defensive estimate persist failed: {type(exc).__name__}: {exc}')
