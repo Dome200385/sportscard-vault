@@ -6,11 +6,28 @@ from statistics import median
 from typing import Any
 from datetime import date, timedelta
 import re
+import unicodedata
 
 import httpx
 
 from .config import settings
 
+
+
+
+def _search_text(value: Any) -> str:
+    """Provider-facing text normalizer.
+
+    eBay titles frequently omit diacritics (e.g. Doncic vs Dončić).  Keep the
+    local matcher strict, but make discovery ASCII-tolerant so provider search
+    does not miss otherwise obvious listings.
+    """
+    if value is None:
+        return ""
+    text = unicodedata.normalize("NFKD", str(value))
+    text = "".join(ch for ch in text if not unicodedata.combining(ch))
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
 
 def _norm(value: Any) -> str:
     if value is None:
@@ -155,32 +172,42 @@ class MarketFingerprint:
         return out
 
     def coverage_queries(self) -> list[dict[str, Any]]:
-        """Progressively broader provider discovery queries for unresolved cards.
+        """High-yield discovery queries for unresolved cards.
 
-        Provider discovery may be broad, but local identity matching remains strict:
-        player/card number/parallel/grade mismatches can never become verified comps.
-        The longer 365-day window is intentionally limited to the coverage flow.
+        V0.22.9.0 deliberately puts the safest *broad* queries first.  With a
+        collection-wide request budget, every unresolved card must get a useful
+        first attempt; an over-specific product+player+number query wasted too
+        many credits when eBay titles omitted product wording.  Verification is
+        unchanged and remains strict after discovery.
         """
         product = self.product_line or self.set_name
+        subject = _search_text(self.subject)
+        product_search = _search_text(product or self.manufacturer)
+        insert_search = _search_text(self.insert_name)
+        card_number = _search_text(self.card_number)
         candidates: list[dict[str, Any]] = []
 
         def add(parts: list[Any], strategy: str, *, exact: bool = False, days: int = 365):
-            q = " ".join(str(x) for x in parts if x not in (None, "")).strip()
+            q = " ".join(_search_text(x) for x in parts if x not in (None, "")).strip()
             if q and q not in {c["query"] for c in candidates}:
                 candidates.append({"query": q, "exact_match": exact, "strategy": strategy, "history_days": days})
 
-        # Start with the normal identity-rich query, but use non-exact provider search.
-        add([product or self.manufacturer, self.subject, self.card_number or self.release_year], "identity_broad")
-        # Card number + player is the safest broad query when the product/manufacturer
-        # recognition is imperfect (common with older or insert-heavy cards).
-        if self.card_number:
-            add([self.subject, self.card_number], "subject_card_number")
-        # Insert/subset names can be more useful than the product line on eBay titles.
-        if self.insert_name:
-            add([self.subject, self.insert_name, self.card_number], "subject_insert")
-        # Final discovery query removes card number only at provider level. The local
-        # matcher still requires the number whenever the scanned card has one.
-        add([product or self.manufacturer, self.subject], "product_subject")
+        # Best first request: player + printed number. It survives imperfect brand/set
+        # recognition and is still highly selective for trading cards.
+        if card_number:
+            add([subject, card_number], "subject_card_number")
+        # Insert/subset wording often appears in titles even when the main product name does not.
+        if insert_search:
+            add([subject, insert_search, card_number], "subject_insert")
+        # Product + player is deliberately broader; the strict local matcher still
+        # enforces a scanned card number whenever one exists.
+        add([product_search, subject], "product_subject")
+        # Last resort: player only. This can return many raw listings, but cannot
+        # become a verified comp unless the local identity matcher accepts it.
+        add([subject], "subject_only")
+        # Keep the old identity-rich form as a later diagnostic strategy rather than
+        # spending the first request on it.
+        add([product_search, subject, card_number or self.release_year], "identity_rich")
         return candidates
 
     def as_dict(self) -> dict[str, Any]:
@@ -444,6 +471,8 @@ def soldcomps_search(fp: MarketFingerprint, *, query_override: str | None = None
         "total_items": data.get("totalItems", len(items)),
         "total_results": data.get("totalResults"),
         "has_next_page": bool(data.get("hasNextPage")),
+        "scraped_count": data.get("scrapedCount"),
+        "auto_selected_category": data.get("autoSelectedCategory"),
         "ebay_site": settings.soldcomps_ebay_site,
         "sold_after": params["soldAfter"],
         "exact_match": exact_match,

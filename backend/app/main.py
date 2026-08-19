@@ -27,7 +27,7 @@ STATIC_INDEX = Path(__file__).resolve().parent.parent / "static" / "index.html"
 
 logger = logging.getLogger("sportscard-vault")
 
-app = FastAPI(title="SportsCard Vault API", version="0.22.8.0", description="Detailed sports-card collection API with editable scan review, correction learning data, transparent comp-based valuation, and an offline-first test UI.")
+app = FastAPI(title="SportsCard Vault API", version="0.22.9.0", description="Detailed sports-card collection API with editable scan review, correction learning data, transparent comp-based valuation, and an offline-first test UI.")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=False, allow_methods=["*"], allow_headers=["*"])
 
 from contextlib import asynccontextmanager
@@ -57,7 +57,7 @@ async def lifespan(app: FastAPI):
 app.router.lifespan_context = lifespan
 
 @app.get("/health")
-def health(): return {"status":"ok","version":"0.22.8.0","environment":settings.app_env,"recognition":settings.recognition_provider,"pricing_provider":settings.price_provider,"database_provider":settings.database_provider}
+def health(): return {"status":"ok","version":"0.22.9.0","environment":settings.app_env,"recognition":settings.recognition_provider,"pricing_provider":settings.price_provider,"database_provider":settings.database_provider}
 
 
 def _serve_test_ui():
@@ -1082,7 +1082,7 @@ def collection_market_coverage_diagnostics():
 def refresh_collection_market_coverage(max_requests: int = Query(30, ge=1, le=50)):
     """Multi-stage SoldComps recovery for cards without verified market value.
 
-    V0.22.8.0 expands *provider discovery*, not verification. Searches use up to a
+    V0.22.9.0 expands *provider discovery*, not verification. Searches use up to a
     365-day sold-history window and progressively remove unreliable recognized
     product wording. Every returned sale still passes the same strict local identity
     matcher before it can become a verified comp. This means broad discovery cannot
@@ -1154,6 +1154,15 @@ def refresh_collection_market_coverage(max_requests: int = Query(30, ge=1, le=50
                     exact_match=bool(strategy.get("exact_match")),
                     history_days=int(strategy.get("history_days") or settings.soldcomps_days),
                 )
+                attempt.update({
+                    "provider_total_items":search.get("total_items"),
+                    "provider_total_results":search.get("total_results"),
+                    "provider_scraped_count":search.get("scraped_count"),
+                    "provider_has_next_page":bool(search.get("has_next_page")),
+                    "provider_category":search.get("auto_selected_category"),
+                    "ebay_site":search.get("ebay_site"),
+                    "sold_after":search.get("sold_after"),
+                })
                 requests_used += 1
                 before=_card_market_state(cid).get("current_value")
                 result=_ingest_soldcomps_search(cid,cards[cid],search)
