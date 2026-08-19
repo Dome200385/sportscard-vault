@@ -27,7 +27,7 @@ STATIC_INDEX = Path(__file__).resolve().parent.parent / "static" / "index.html"
 
 logger = logging.getLogger("sportscard-vault")
 
-app = FastAPI(title="SportsCard Vault API", version="0.22.7.1", description="Detailed sports-card collection API with editable scan review, correction learning data, transparent comp-based valuation, and an offline-first test UI.")
+app = FastAPI(title="SportsCard Vault API", version="0.22.8.0", description="Detailed sports-card collection API with editable scan review, correction learning data, transparent comp-based valuation, and an offline-first test UI.")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=False, allow_methods=["*"], allow_headers=["*"])
 
 from contextlib import asynccontextmanager
@@ -57,7 +57,7 @@ async def lifespan(app: FastAPI):
 app.router.lifespan_context = lifespan
 
 @app.get("/health")
-def health(): return {"status":"ok","version":"0.22.7.1","environment":settings.app_env,"recognition":settings.recognition_provider,"pricing_provider":settings.price_provider,"database_provider":settings.database_provider}
+def health(): return {"status":"ok","version":"0.22.8.0","environment":settings.app_env,"recognition":settings.recognition_provider,"pricing_provider":settings.price_provider,"database_provider":settings.database_provider}
 
 
 def _serve_test_ui():
@@ -1057,14 +1057,36 @@ def create_collection_performance_baseline():
     return {"status":"created","snapshot_id":sid,"message":"Performance-Basis gespeichert; künftige Zugänge/Abgänge werden getrennt von Marktbewegungen ausgewiesen."}
 
 
-@app.post("/api/v1/collection/market/coverage-refresh")
-def refresh_collection_market_coverage(max_requests: int = Query(20, ge=1, le=50)):
-    """Second-pass SoldComps discovery for cards that still have no market value.
+# Last-run diagnostics are display-only and never influence valuation. They survive
+# ordinary page reloads for the lifetime of the Render worker.
+_LAST_COVERAGE_DIAGNOSTICS: dict[str, dict] = {}
 
-    V0.22.5 deliberately does not invent prices and does not touch already-valued
-    cards. It uses a broader provider query only to discover candidate sold listings;
-    every result must still pass the strict local identity matcher before being
-    persisted as a verified comp. This keeps the operation quota-conscious.
+
+def _coverage_rejection_summary(rejected_preview: list[dict]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for row in rejected_preview or []:
+        reasons=row.get("reasons") or []
+        if not reasons:
+            counts["score_below_threshold"] = counts.get("score_below_threshold",0)+1
+        for reason in reasons:
+            counts[str(reason)] = counts.get(str(reason),0)+1
+    return dict(sorted(counts.items(), key=lambda kv:(-kv[1],kv[0])))
+
+
+@app.get("/api/v1/collection/market/coverage-diagnostics")
+def collection_market_coverage_diagnostics():
+    return {"cards":_LAST_COVERAGE_DIAGNOSTICS,"count":len(_LAST_COVERAGE_DIAGNOSTICS)}
+
+
+@app.post("/api/v1/collection/market/coverage-refresh")
+def refresh_collection_market_coverage(max_requests: int = Query(30, ge=1, le=50)):
+    """Multi-stage SoldComps recovery for cards without verified market value.
+
+    V0.22.8.0 expands *provider discovery*, not verification. Searches use up to a
+    365-day sold-history window and progressively remove unreliable recognized
+    product wording. Every returned sale still passes the same strict local identity
+    matcher before it can become a verified comp. This means broad discovery cannot
+    turn a wrong player/card number/parallel into a market value.
     """
     if not settings.soldcomps_api_key:
         return {
@@ -1075,7 +1097,6 @@ def refresh_collection_market_coverage(max_requests: int = Query(20, ge=1, le=50
     summary=_compute_collection_market_summary()
     states=summary.get("cards") or {}
     unresolved=[cid for cid,state in states.items() if state.get("current_value") is None]
-
     if not unresolved:
         return {
             "status":"already_complete","cards_without_value":0,"cards_recovered":0,
@@ -1083,10 +1104,9 @@ def refresh_collection_market_coverage(max_requests: int = Query(20, ge=1, le=50
             "message":"Alle Karten mit vorhandenen Marktdaten sind bereits bewertet."
         }
 
-    # Group identical fallback searches so duplicate/closely related holdings consume
-    # one provider request. A broad provider search is safe because ingestion still
-    # performs exact player/card/parallel/grade checks locally.
-    groups: dict[str, list[tuple[str, dict, dict]]] = {}
+    cards: dict[str,dict] = {}
+    strategies: dict[str,list[dict]] = {}
+    diagnostics: dict[str,dict] = {}
     skipped=[]
     for cid in unresolved:
         card=db.get_card(cid)
@@ -1094,85 +1114,121 @@ def refresh_collection_market_coverage(max_requests: int = Query(20, ge=1, le=50
             skipped.append({"card_id":cid,"reason":"card_not_found"})
             continue
         fp=build_fingerprint(card)
-        strategies=fp.soldcomps_queries()
-        fallback=next((x for x in strategies if x.get("strategy")=="fallback_broad"),None)
-        if not fallback or not fallback.get("query"):
+        qs=fp.coverage_queries()
+        if not qs:
             skipped.append({"card_id":cid,"reason":"insufficient_fingerprint"})
             continue
-        groups.setdefault(fallback["query"],[]).append((cid,card,fallback))
+        cards[cid]=card
+        strategies[cid]=qs
+        diagnostics[cid]={
+            "card_id":cid,
+            "player":fp.subject,
+            "card_number":fp.card_number,
+            "product":fp.product_line or fp.set_name,
+            "attempts":[],"raw_results":0,"identity_matches":0,"included_matches":0,
+            "new_comps":0,"recovered":False,"top_rejection_reasons":{},
+        }
 
-    selected_queries=list(groups.keys())[:max_requests]
-    deferred_queries=list(groups.keys())[max_requests:]
-    search_cache: dict[str,dict]={}; search_errors: dict[str,dict]={}
-    max_workers=max(1,min(4,len(selected_queries)))
-
-    def _coverage_search(query: str):
-        cid,card,strategy=groups[query][0]
-        fp=build_fingerprint(card)
-        return soldcomps_search(fp,query_override=query,exact_match=False)
-
-    if selected_queries:
-        with ThreadPoolExecutor(max_workers=max_workers,thread_name_prefix="coverage-soldcomps") as pool:
-            futures={pool.submit(_coverage_search,q):q for q in selected_queries}
-            for fut in as_completed(futures):
-                q=futures[fut]
-                try: search_cache[q]=fut.result()
-                except SoldCompsError as exc:
-                    search_errors[q]={"http_status":exc.status_code,"code":exc.code,"message":str(exc)}
-                except Exception as exc:
-                    search_errors[q]={"message":f"{type(exc).__name__}: {exc}"}
-
-    recovered=0; new_comps=0; details=[]; errors=[]
-    for query in selected_queries:
-        rows=groups[query]
-        if query in search_errors:
-            for cid,_card,_strategy in rows:
-                errors.append({"card_id":cid,"query":query,**search_errors[query]})
-            continue
-        provider_result=search_cache.get(query)
-        if not provider_result:
-            continue
-        for cid,card,strategy in rows:
+    requests_used=0; recovered=0; new_comps=0; errors=[]
+    # Fair round-robin: every unresolved card gets the first broad identity search
+    # before any card consumes a second/third request.
+    max_stages=max((len(v) for v in strategies.values()), default=0)
+    for stage_idx in range(max_stages):
+        if requests_used>=max_requests: break
+        for cid in unresolved:
+            if requests_used>=max_requests: break
+            if cid not in cards or diagnostics[cid].get("recovered"): continue
+            qs=strategies.get(cid) or []
+            if stage_idx>=len(qs): continue
+            strategy=qs[stage_idx]
+            fp=build_fingerprint(cards[cid])
+            attempt={
+                "strategy":strategy.get("strategy"),"query":strategy.get("query"),
+                "history_days":int(strategy.get("history_days") or settings.soldcomps_days),
+                "exact_match":bool(strategy.get("exact_match")),
+            }
             try:
+                search=soldcomps_search(
+                    fp,
+                    query_override=strategy.get("query"),
+                    exact_match=bool(strategy.get("exact_match")),
+                    history_days=int(strategy.get("history_days") or settings.soldcomps_days),
+                )
+                requests_used += 1
                 before=_card_market_state(cid).get("current_value")
-                result=_ingest_soldcomps_search(cid,card,provider_result)
+                result=_ingest_soldcomps_search(cid,cards[cid],search)
                 after=result.get("current_market",{}).get("current_value")
-                if before is None and after is not None:
-                    recovered += 1
-                new_comps += result.get("new_comps") or 0
-                details.append({
-                    "card_id":cid,"strategy":"fallback_broad","query":query,
-                    "raw_results":result.get("raw_results") or 0,
-                    "identity_matches":result.get("identity_matches") or 0,
-                    "included_matches":result.get("included_matches") or 0,
-                    "new_comps":result.get("new_comps") or 0,
-                    "recovered":bool(before is None and after is not None),
+                raw=int(result.get("raw_results") or 0); matched=int(result.get("identity_matches") or 0)
+                included=int(result.get("included_matches") or 0); added=int(result.get("new_comps") or 0)
+                reasons=_coverage_rejection_summary(result.get("rejected_preview") or [])
+                attempt.update({
+                    "raw_results":raw,"identity_matches":matched,"included_matches":included,
+                    "new_comps":added,"rejection_reasons":reasons,
+                    "rejected_preview":result.get("rejected_preview") or [],
                 })
+                d=diagnostics[cid]; d["attempts"].append(attempt)
+                d["raw_results"] += raw; d["identity_matches"] += matched
+                d["included_matches"] += included; d["new_comps"] += added
+                merged=d.get("top_rejection_reasons") or {}
+                for reason,count in reasons.items(): merged[reason]=merged.get(reason,0)+count
+                d["top_rejection_reasons"]=dict(sorted(merged.items(),key=lambda kv:(-kv[1],kv[0])))
+                new_comps += added
+                if before is None and after is not None:
+                    d["recovered"]=True; recovered += 1
+            except SoldCompsError as exc:
+                requests_used += 1
+                attempt["error"]={"http_status":exc.status_code,"code":exc.code,"message":str(exc)}
+                diagnostics[cid]["attempts"].append(attempt)
+                errors.append({"card_id":cid,"query":strategy.get("query"),**attempt["error"]})
+                # Quota/rate errors should stop the run rather than burning requests.
+                if exc.code in {"quota_exceeded","rate_limit_exceeded"} or exc.status_code==429:
+                    break
             except Exception as exc:
-                errors.append({"card_id":cid,"query":query,"message":f"{type(exc).__name__}: {exc}"})
+                requests_used += 1
+                attempt["error"]={"message":f"{type(exc).__name__}: {exc}"}
+                diagnostics[cid]["attempts"].append(attempt)
+                errors.append({"card_id":cid,"query":strategy.get("query"),**attempt["error"]})
+        else:
+            continue
+        # inner loop broke on quota/rate error
+        if errors and (errors[-1].get("code") in {"quota_exceeded","rate_limit_exceeded"} or errors[-1].get("http_status")==429):
+            break
 
+    # Human-readable classification for the collection cards.
+    for cid,d in diagnostics.items():
+        if d.get("recovered"):
+            d["status"]="verified_price_found"
+            d["label"]=f"{d.get('new_comps',0)} neue Comps"
+        elif d.get("raw_results",0)==0:
+            d["status"]="no_provider_results"
+            d["label"]="0 SoldComps-Treffer"
+        elif d.get("identity_matches",0)==0:
+            d["status"]="all_rejected"
+            reasons=list((d.get("top_rejection_reasons") or {}).keys())[:2]
+            d["label"]=(f"{d.get('raw_results',0)} gefunden · verworfen" + (" ("+", ".join(reasons)+")" if reasons else ""))
+        else:
+            d["status"]="matches_not_valued"
+            d["label"]=f"{d.get('raw_results',0)} gefunden · {d.get('identity_matches',0)} Match(es)"
+
+    _LAST_COVERAGE_DIAGNOSTICS.clear(); _LAST_COVERAGE_DIAGNOSTICS.update(diagnostics)
     snapshot_id=_record_collection_market_snapshot("coverage_refresh")
     after_summary=_compute_collection_market_summary()
     remaining=max(0,(after_summary.get("cards_considered") or 0)-(after_summary.get("valued_cards") or 0))
     status="updated" if recovered or new_comps else ("partial" if errors else "no_new_matches")
+    rejected_cards=sum(1 for d in diagnostics.values() if d.get("status")=="all_rejected")
+    zero_cards=sum(1 for d in diagnostics.values() if d.get("status")=="no_provider_results")
     return {
-        "status":status,
-        "cards_without_value_before":len(unresolved),
-        "cards_recovered":recovered,
-        "cards_without_value_after":remaining,
-        "provider_requests_used":len(selected_queries),
-        "request_budget":max_requests,
-        "deferred_query_groups":len(deferred_queries),
-        "new_verified_comps":new_comps,
-        "collection_snapshot_id":snapshot_id,
-        "errors":errors,"skipped":skipped,"details":details,
+        "status":status,"cards_without_value_before":len(unresolved),"cards_recovered":recovered,
+        "cards_without_value_after":remaining,"provider_requests_used":requests_used,
+        "request_budget":max_requests,"new_verified_comps":new_comps,"collection_snapshot_id":snapshot_id,
+        "errors":errors,"skipped":skipped,"details":list(diagnostics.values()),
+        "diagnostics":{"zero_result_cards":zero_cards,"all_rejected_cards":rejected_cards},
         "message":(
-            f"Abdeckungs-Suche: {len(selected_queries)} zusätzliche SoldComps-Abfragen, "
+            f"Abdeckungs-Suche: {requests_used} SoldComps-Abfragen (bis 365 Tage), "
             f"{recovered} Karten neu bewertet, {new_comps} neue verifizierte Comps. "
-            f"{remaining} Karten bleiben ohne Marktwert."
+            f"{zero_cards} Karten ohne Provider-Treffer, {rejected_cards} mit Treffern aber ohne sicheren Identitäts-Match."
         ),
     }
-
 
 
 

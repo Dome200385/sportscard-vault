@@ -149,10 +149,39 @@ class MarketFingerprint:
         fallback = self.soldcomps_fallback_query().strip()
         out: list[dict[str, Any]] = []
         if primary:
-            out.append({"query": primary, "exact_match": True, "strategy": "primary_exact"})
+            out.append({"query": primary, "exact_match": True, "strategy": "primary_exact", "history_days": None})
         if fallback:
-            out.append({"query": fallback, "exact_match": False, "strategy": "fallback_broad"})
+            out.append({"query": fallback, "exact_match": False, "strategy": "fallback_broad", "history_days": None})
         return out
+
+    def coverage_queries(self) -> list[dict[str, Any]]:
+        """Progressively broader provider discovery queries for unresolved cards.
+
+        Provider discovery may be broad, but local identity matching remains strict:
+        player/card number/parallel/grade mismatches can never become verified comps.
+        The longer 365-day window is intentionally limited to the coverage flow.
+        """
+        product = self.product_line or self.set_name
+        candidates: list[dict[str, Any]] = []
+
+        def add(parts: list[Any], strategy: str, *, exact: bool = False, days: int = 365):
+            q = " ".join(str(x) for x in parts if x not in (None, "")).strip()
+            if q and q not in {c["query"] for c in candidates}:
+                candidates.append({"query": q, "exact_match": exact, "strategy": strategy, "history_days": days})
+
+        # Start with the normal identity-rich query, but use non-exact provider search.
+        add([product or self.manufacturer, self.subject, self.card_number or self.release_year], "identity_broad")
+        # Card number + player is the safest broad query when the product/manufacturer
+        # recognition is imperfect (common with older or insert-heavy cards).
+        if self.card_number:
+            add([self.subject, self.card_number], "subject_card_number")
+        # Insert/subset names can be more useful than the product line on eBay titles.
+        if self.insert_name:
+            add([self.subject, self.insert_name, self.card_number], "subject_insert")
+        # Final discovery query removes card number only at provider level. The local
+        # matcher still requires the number whenever the scanned card has one.
+        add([product or self.manufacturer, self.subject], "product_subject")
+        return candidates
 
     def as_dict(self) -> dict[str, Any]:
         d = asdict(self)
@@ -375,7 +404,7 @@ class SoldCompsError(RuntimeError):
         self.code = code
 
 
-def soldcomps_search(fp: MarketFingerprint, *, query_override: str | None = None, exact_match: bool = True) -> dict[str, Any]:
+def soldcomps_search(fp: MarketFingerprint, *, query_override: str | None = None, exact_match: bool = True, history_days: int | None = None) -> dict[str, Any]:
     if not settings.soldcomps_api_key:
         raise SoldCompsError("SOLDCOMPS_API_KEY is not configured")
     query = (query_override or fp.soldcomps_query()).strip()
@@ -390,7 +419,7 @@ def soldcomps_search(fp: MarketFingerprint, *, query_override: str | None = None
         "sold": "true",
         "exactMatch": "true" if exact_match else "false",
         "includeCompleteListing": "true",
-        "soldAfter": (date.today() - timedelta(days=settings.soldcomps_days)).isoformat(),
+        "soldAfter": (date.today() - timedelta(days=int(history_days or settings.soldcomps_days))).isoformat(),
     }
     headers = {"Authorization": f"Bearer {settings.soldcomps_api_key}", "Accept": "application/json"}
     try:
@@ -477,7 +506,12 @@ def normalize_soldcomps_results(fp: MarketFingerprint, search: dict[str, Any]) -
         "rejected_count": len(rejected) + (len(matches) - len(selected)),
         "included_count": sum(1 for r in selected if r.get("included_in_valuation")),
         "rejected_preview": [
-            {"title": r["item"].get("title"), "score": r["match"]["score"], "reasons": r["match"]["hard_mismatches"]}
+            {
+                "title": r["item"].get("title"),
+                "score": r["match"]["score"],
+                "reasons": r["match"]["hard_mismatches"],
+                "evidence": r["match"].get("evidence") or [],
+            }
             for r in rejected[:8]
         ],
     }
