@@ -6,11 +6,55 @@ from statistics import median
 from typing import Any
 from datetime import date, timedelta
 import re
+import unicodedata
+import time
+from datetime import datetime, timezone
 
 import httpx
 
 from .config import settings
 
+
+# V0.23.0 provider resilience: display-only runtime health. This never changes
+# valuation and is intentionally process-local; persisted comps remain the source of truth.
+_SOLDCOMPS_HEALTH: dict[str, Any] = {
+    "state": "unknown", "last_success_at": None, "last_error_at": None,
+    "last_http_status": None, "last_error": None, "consecutive_failures": 0,
+}
+
+def _health_stamp() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+def _soldcomps_success() -> None:
+    _SOLDCOMPS_HEALTH.update({
+        "state":"operational", "last_success_at":_health_stamp(), "last_http_status":200,
+        "last_error":None, "consecutive_failures":0,
+    })
+
+def _soldcomps_failure(message: str, status_code: int | None = None) -> None:
+    failures=int(_SOLDCOMPS_HEALTH.get("consecutive_failures") or 0)+1
+    transient=status_code in {500,502,503,504} or status_code is None
+    _SOLDCOMPS_HEALTH.update({
+        "state":"degraded" if transient else "error", "last_error_at":_health_stamp(),
+        "last_http_status":status_code, "last_error":message[:300], "consecutive_failures":failures,
+    })
+
+
+
+
+def _search_text(value: Any) -> str:
+    """Provider-facing text normalizer.
+
+    eBay titles frequently omit diacritics (e.g. Doncic vs Dončić).  Keep the
+    local matcher strict, but make discovery ASCII-tolerant so provider search
+    does not miss otherwise obvious listings.
+    """
+    if value is None:
+        return ""
+    text = unicodedata.normalize("NFKD", str(value))
+    text = "".join(ch for ch in text if not unicodedata.combining(ch))
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
 
 def _norm(value: Any) -> str:
     if value is None:
@@ -149,10 +193,49 @@ class MarketFingerprint:
         fallback = self.soldcomps_fallback_query().strip()
         out: list[dict[str, Any]] = []
         if primary:
-            out.append({"query": primary, "exact_match": True, "strategy": "primary_exact"})
+            out.append({"query": primary, "exact_match": True, "strategy": "primary_exact", "history_days": None})
         if fallback:
-            out.append({"query": fallback, "exact_match": False, "strategy": "fallback_broad"})
+            out.append({"query": fallback, "exact_match": False, "strategy": "fallback_broad", "history_days": None})
         return out
+
+    def coverage_queries(self) -> list[dict[str, Any]]:
+        """High-yield discovery queries for unresolved cards.
+
+        V0.22.9.0 deliberately puts the safest *broad* queries first.  With a
+        collection-wide request budget, every unresolved card must get a useful
+        first attempt; an over-specific product+player+number query wasted too
+        many credits when eBay titles omitted product wording.  Verification is
+        unchanged and remains strict after discovery.
+        """
+        product = self.product_line or self.set_name
+        subject = _search_text(self.subject)
+        product_search = _search_text(product or self.manufacturer)
+        insert_search = _search_text(self.insert_name)
+        card_number = _search_text(self.card_number)
+        candidates: list[dict[str, Any]] = []
+
+        def add(parts: list[Any], strategy: str, *, exact: bool = False, days: int = 365):
+            q = " ".join(_search_text(x) for x in parts if x not in (None, "")).strip()
+            if q and q not in {c["query"] for c in candidates}:
+                candidates.append({"query": q, "exact_match": exact, "strategy": strategy, "history_days": days})
+
+        # Best first request: player + printed number. It survives imperfect brand/set
+        # recognition and is still highly selective for trading cards.
+        if card_number:
+            add([subject, card_number], "subject_card_number")
+        # Insert/subset wording often appears in titles even when the main product name does not.
+        if insert_search:
+            add([subject, insert_search, card_number], "subject_insert")
+        # Product + player is deliberately broader; the strict local matcher still
+        # enforces a scanned card number whenever one exists.
+        add([product_search, subject], "product_subject")
+        # Last resort: player only. This can return many raw listings, but cannot
+        # become a verified comp unless the local identity matcher accepts it.
+        add([subject], "subject_only")
+        # Keep the old identity-rich form as a later diagnostic strategy rather than
+        # spending the first request on it.
+        add([product_search, subject, card_number or self.release_year], "identity_rich")
+        return candidates
 
     def as_dict(self) -> dict[str, Any]:
         d = asdict(self)
@@ -375,49 +458,57 @@ class SoldCompsError(RuntimeError):
         self.code = code
 
 
-def soldcomps_search(fp: MarketFingerprint, *, query_override: str | None = None, exact_match: bool = True) -> dict[str, Any]:
+def soldcomps_search(fp: MarketFingerprint, *, query_override: str | None = None, exact_match: bool = True, history_days: int | None = None) -> dict[str, Any]:
     if not settings.soldcomps_api_key:
         raise SoldCompsError("SOLDCOMPS_API_KEY is not configured")
     query = (query_override or fp.soldcomps_query()).strip()
     if not fp.subject or not (fp.product_line or fp.set_name) or not query:
         raise SoldCompsError("Fingerprint is too incomplete for an automatic sold-comps search")
     params: dict[str, Any] = {
-        "keyword": query,
-        "page": 1,
-        "count": settings.soldcomps_count,
-        "ebaySite": settings.soldcomps_ebay_site,
-        "sortOrder": "endedRecently",
-        "sold": "true",
-        "exactMatch": "true" if exact_match else "false",
-        "includeCompleteListing": "true",
-        "soldAfter": (date.today() - timedelta(days=settings.soldcomps_days)).isoformat(),
+        "keyword": query, "page": 1, "count": settings.soldcomps_count,
+        "ebaySite": settings.soldcomps_ebay_site, "sortOrder": "endedRecently", "sold": "true",
+        "exactMatch": "true" if exact_match else "false", "includeCompleteListing": "true",
+        "soldAfter": (date.today() - timedelta(days=int(history_days or settings.soldcomps_days))).isoformat(),
     }
     headers = {"Authorization": f"Bearer {settings.soldcomps_api_key}", "Accept": "application/json"}
-    try:
-        with httpx.Client(timeout=settings.soldcomps_timeout_seconds, follow_redirects=True) as client:
-            response = client.get(settings.soldcomps_api_base.rstrip("/") + "/v1/scrape", params=params, headers=headers)
-    except httpx.HTTPError as exc:
-        raise SoldCompsError(f"SoldComps network error: {exc}") from exc
-    if response.status_code != 200:
+    url=settings.soldcomps_api_base.rstrip("/") + "/v1/scrape"
+    response=None
+    last_network_error=None
+    # SoldComps announced instability of sold-listing requests. Retry only transient
+    # failures; never retry auth/quota/client errors and never fabricate a fallback price.
+    for attempt in range(3):
         try:
-            body = response.json()
-        except Exception:
-            body = {"message": response.text[:500]}
+            with httpx.Client(timeout=settings.soldcomps_timeout_seconds, follow_redirects=True) as client:
+                response = client.get(url, params=params, headers=headers)
+            if response.status_code not in {500,502,503,504}:
+                break
+        except httpx.HTTPError as exc:
+            last_network_error=exc
+            response=None
+        if attempt < 2:
+            time.sleep(0.6 * (2 ** attempt))
+    if response is None:
+        message=f"SoldComps network error after retries: {last_network_error}"
+        _soldcomps_failure(message, None)
+        raise SoldCompsError(message, code="provider_unavailable") from last_network_error
+    if response.status_code != 200:
+        try: body = response.json()
+        except Exception: body = {"message": response.text[:500]}
         code = body.get("code") if isinstance(body, dict) else None
         message = body.get("message") or body.get("error") or str(body)
-        raise SoldCompsError(f"SoldComps HTTP {response.status_code}: {message}", status_code=response.status_code, code=code)
+        full=f"SoldComps HTTP {response.status_code}: {message}"
+        _soldcomps_failure(full, response.status_code)
+        if response.status_code in {500,502,503,504}: code=code or "provider_unavailable"
+        raise SoldCompsError(full, status_code=response.status_code, code=code)
+    _soldcomps_success()
     data = response.json()
     items = data.get("items") or []
     return {
-        "provider": "soldcomps",
-        "query": query,
-        "items": items,
-        "total_items": data.get("totalItems", len(items)),
-        "total_results": data.get("totalResults"),
-        "has_next_page": bool(data.get("hasNextPage")),
-        "ebay_site": settings.soldcomps_ebay_site,
-        "sold_after": params["soldAfter"],
-        "exact_match": exact_match,
+        "provider":"soldcomps", "query":query, "items":items,
+        "total_items":data.get("totalItems",len(items)), "total_results":data.get("totalResults"),
+        "has_next_page":bool(data.get("hasNextPage")), "scraped_count":data.get("scrapedCount"),
+        "auto_selected_category":data.get("autoSelectedCategory"), "ebay_site":settings.soldcomps_ebay_site,
+        "sold_after":params["soldAfter"], "exact_match":exact_match,
     }
 
 
@@ -477,7 +568,12 @@ def normalize_soldcomps_results(fp: MarketFingerprint, search: dict[str, Any]) -
         "rejected_count": len(rejected) + (len(matches) - len(selected)),
         "included_count": sum(1 for r in selected if r.get("included_in_valuation")),
         "rejected_preview": [
-            {"title": r["item"].get("title"), "score": r["match"]["score"], "reasons": r["match"]["hard_mismatches"]}
+            {
+                "title": r["item"].get("title"),
+                "score": r["match"]["score"],
+                "reasons": r["match"]["hard_mismatches"],
+                "evidence": r["match"].get("evidence") or [],
+            }
             for r in rejected[:8]
         ],
     }
@@ -502,6 +598,7 @@ def provider_status() -> list[dict[str, Any]]:
             "mode": "live" if settings.soldcomps_api_key else "not-configured",
             "ebay_site": settings.soldcomps_ebay_site,
             "history_days": settings.soldcomps_days,
+            "health": dict(_SOLDCOMPS_HEALTH),
             "note": "Completed eBay sales only; asking prices are never used as market value.",
         },
         {
