@@ -1,10 +1,18 @@
-# Mobile V0.1
-Flutter source for the first Android shell.
+# SportsCard Vault V0.8
 
-Because Flutter is not installed in the build environment used to create this pack, this source was structurally prepared but not compiled here. On a machine with Flutter:
+Scan-first Sports-Card-Collection-App für detaillierte Erfassung großer Sammlungen.
+
+## Testfokus dieser Version
+Vorder- und Rückseite fotografieren → automatische Vision-Analyse → detaillierte Felder mit Confidence → nur Unsicherheiten korrigieren → speichern.
+
+## Deployment
+Siehe `DEPLOY_RENDER.md`.
+
+## Backend-Tests
 ```bash
-flutter create . --platforms=android
-flutter pub get
-flutter run
+cd backend
+pip install -r requirements.txt
+PYTHONPATH=. python -m pytest -q
 ```
-The default API URL is `http://10.0.2.2:8000` for an Android emulator. For a physical phone, replace it with the LAN or deployed Render URL.
+
+Aktueller Stand: **10/10 Tests bestanden**.
