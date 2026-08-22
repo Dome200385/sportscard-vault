@@ -21,13 +21,13 @@ from .recognition import analyze_images
 from .catalog import rank_catalog
 from .image_storage import persist_image, signed_url, storage_ready, storage_diagnostics
 from . import postgres_probe
-from .market_providers import (build_fingerprint, provider_status, score_candidate, soldcomps_search, normalize_soldcomps_results, SoldCompsError)
+from .market_providers import (build_fingerprint, provider_status, score_candidate, soldcomps_search, normalize_soldcomps_results, active_listings_search, normalize_active_listings, SoldCompsError)
 
 STATIC_INDEX = Path(__file__).resolve().parent.parent / "static" / "index.html"
 
 logger = logging.getLogger("sportscard-vault")
 
-app = FastAPI(title="SportsCard Vault API", version="0.22.9.0", description="Detailed sports-card collection API with editable scan review, correction learning data, transparent comp-based valuation, and an offline-first test UI.")
+app = FastAPI(title="SportsCard Vault API", version="0.24.0", description="Detailed sports-card collection API with editable scan review, correction learning data, transparent comp-based valuation, and an offline-first test UI.")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=False, allow_methods=["*"], allow_headers=["*"])
 
 from contextlib import asynccontextmanager
@@ -57,7 +57,7 @@ async def lifespan(app: FastAPI):
 app.router.lifespan_context = lifespan
 
 @app.get("/health")
-def health(): return {"status":"ok","version":"0.22.9.0","environment":settings.app_env,"recognition":settings.recognition_provider,"pricing_provider":settings.price_provider,"database_provider":settings.database_provider}
+def health(): return {"status":"ok","version":"0.24.0","environment":settings.app_env,"recognition":settings.recognition_provider,"pricing_provider":settings.price_provider,"database_provider":settings.database_provider}
 
 
 def _serve_test_ui():
@@ -611,7 +611,7 @@ def market_provider_status():
     return {
         "providers": provider_status(),
         "automatic_provider_configured": bool(settings.soldcomps_api_key),
-        "policy": "Only completed sold listings are used as automatic comps. Asking prices and AI-invented prices are excluded.",
+        "policy": "Completed sales are the only automatic comps used for market value. Active asking prices are a separate display-only indicator; AI estimates remain separate.",
     }
 
 @app.get("/api/v1/cards/{card_id}/market-fingerprint")
@@ -1078,6 +1078,101 @@ def collection_market_coverage_diagnostics():
     return {"cards":_LAST_COVERAGE_DIAGNOSTICS,"count":len(_LAST_COVERAGE_DIAGNOSTICS)}
 
 
+# V0.24.0: Active eBay asking-price market. Display-only and deliberately
+# excluded from verified comps, collection value, price history and AI training.
+_ACTIVE_MARKET_CACHE: dict[str, dict] = {}
+_ACTIVE_MARKET_LAST_REFRESH: str | None = None
+
+@app.get("/api/v1/collection/market/active-summary")
+def collection_active_market_summary():
+    return {
+        "cards":_ACTIVE_MARKET_CACHE,
+        "count":len(_ACTIVE_MARKET_CACHE),
+        "last_refresh":_ACTIVE_MARKET_LAST_REFRESH,
+        "policy":"Active asking prices are not sales and never affect portfolio market value.",
+    }
+
+@app.post("/api/v1/cards/{card_id}/market/active-refresh")
+def refresh_card_active_market(card_id: str):
+    global _ACTIVE_MARKET_LAST_REFRESH
+    card=db.get_card(card_id)
+    if not card: raise HTTPException(404,"Card not found")
+    fp=build_fingerprint(card)
+    try:
+        search=active_listings_search(fp, exact_match=False)
+        summary=normalize_active_listings(fp,search)
+        payload={
+            "card_id":card_id,"status":"updated" if summary.get("included_count") else "no_matches",
+            "source":"soldcomps_active","query":summary.get("query"),
+            "raw_results":summary.get("raw_count",0),"identity_matches":summary.get("identity_matches",0),
+            "listing_count":summary.get("included_count",0),"median_ask":summary.get("median_ask"),
+            "low_ask":summary.get("low_ask"),"high_ask":summary.get("high_ask"),
+            "currency":summary.get("currency"),"items":summary.get("items") or [],
+            "updated_at":datetime.now(timezone.utc).isoformat(),
+            "disclaimer":"Angebotspreise sind keine realisierten Verkaufspreise und beeinflussen den Marktwert nicht.",
+        }
+        _ACTIVE_MARKET_CACHE[card_id]=payload
+        _ACTIVE_MARKET_LAST_REFRESH=payload["updated_at"]
+        return payload
+    except SoldCompsError as exc:
+        return {
+            "card_id":card_id,"status":"provider_error","provider_http_status":exc.status_code,
+            "provider_error_code":exc.code,"message":str(exc),"providers":provider_status(),
+            "disclaimer":"Vorhandene Marktwerte und KI-Schätzungen bleiben unverändert.",
+        }
+
+@app.post("/api/v1/collection/market/active-refresh")
+def refresh_collection_active_market(max_requests: int = Query(12,ge=1,le=30)):
+    global _ACTIVE_MARKET_LAST_REFRESH
+    listing=db.list_collection(page=1,page_size=200)
+    items=(listing.get("items") or []) if isinstance(listing,dict) else []
+    # Prefer cards without verified sold value; active asks are most useful there.
+    ordered=[]
+    for item in items:
+        cid=item.get("id") or item.get("card_identity_id")
+        if not cid or cid in ordered: continue
+        try: state=_card_market_state(cid)
+        except Exception: state={}
+        if state.get("current_value") is None: ordered.append(cid)
+    if len(ordered)<max_requests:
+        for item in items:
+            cid=item.get("id") or item.get("card_identity_id")
+            if cid and cid not in ordered: ordered.append(cid)
+    results=[]; errors=[]; requests_used=0
+    for cid in ordered[:max_requests]:
+        card=db.get_card(cid)
+        if not card: continue
+        fp=build_fingerprint(card)
+        try:
+            search=active_listings_search(fp, exact_match=False)
+            requests_used+=1
+            summary=normalize_active_listings(fp,search)
+            payload={
+                "card_id":cid,"status":"updated" if summary.get("included_count") else "no_matches",
+                "source":"soldcomps_active","query":summary.get("query"),
+                "raw_results":summary.get("raw_count",0),"identity_matches":summary.get("identity_matches",0),
+                "listing_count":summary.get("included_count",0),"median_ask":summary.get("median_ask"),
+                "low_ask":summary.get("low_ask"),"high_ask":summary.get("high_ask"),
+                "currency":summary.get("currency"),"items":summary.get("items") or [],
+                "updated_at":datetime.now(timezone.utc).isoformat(),
+                "disclaimer":"Angebotspreise sind keine realisierten Verkaufspreise.",
+            }
+            _ACTIVE_MARKET_CACHE[cid]=payload; results.append(payload)
+        except SoldCompsError as exc:
+            requests_used+=1
+            err={"card_id":cid,"http_status":exc.status_code,"code":exc.code,"message":str(exc)}
+            errors.append(err)
+            if exc.code in {"quota_exceeded","rate_limit_exceeded","provider_unavailable"} or exc.status_code in {429,500,502,503,504}:
+                break
+    _ACTIVE_MARKET_LAST_REFRESH=datetime.now(timezone.utc).isoformat()
+    matched=sum(1 for r in results if r.get("listing_count"))
+    return {
+        "status":"partial" if errors else "updated","provider_requests_used":requests_used,
+        "cards_checked":len(results),"cards_with_active_market":matched,"results":results,"errors":errors,
+        "last_refresh":_ACTIVE_MARKET_LAST_REFRESH,
+        "message":f"Angebotsmarkt: {requests_used} Abfragen, {matched} Karten mit streng gematchten aktiven Angeboten. Angebotspreise beeinflussen den verifizierten Marktwert nicht.",
+    }
+
 @app.post("/api/v1/collection/market/coverage-refresh")
 def refresh_collection_market_coverage(max_requests: int = Query(30, ge=1, le=50)):
     """Multi-stage SoldComps recovery for cards without verified market value.
@@ -1190,7 +1285,7 @@ def refresh_collection_market_coverage(max_requests: int = Query(30, ge=1, le=50
                 diagnostics[cid]["attempts"].append(attempt)
                 errors.append({"card_id":cid,"query":strategy.get("query"),**attempt["error"]})
                 # Quota/rate errors should stop the run rather than burning requests.
-                if exc.code in {"quota_exceeded","rate_limit_exceeded"} or exc.status_code==429:
+                if exc.code in {"quota_exceeded","rate_limit_exceeded","provider_unavailable"} or exc.status_code in {429,500,502,503,504}:
                     break
             except Exception as exc:
                 requests_used += 1
@@ -1200,7 +1295,7 @@ def refresh_collection_market_coverage(max_requests: int = Query(30, ge=1, le=50
         else:
             continue
         # inner loop broke on quota/rate error
-        if errors and (errors[-1].get("code") in {"quota_exceeded","rate_limit_exceeded"} or errors[-1].get("http_status")==429):
+        if errors and (errors[-1].get("code") in {"quota_exceeded","rate_limit_exceeded","provider_unavailable"} or errors[-1].get("http_status") in {429,500,502,503,504}):
             break
 
     # Human-readable classification for the collection cards.
@@ -1208,6 +1303,9 @@ def refresh_collection_market_coverage(max_requests: int = Query(30, ge=1, le=50
         if d.get("recovered"):
             d["status"]="verified_price_found"
             d["label"]=f"{d.get('new_comps',0)} neue Comps"
+        elif any((a.get("error") or {}).get("code")=="provider_unavailable" or (a.get("error") or {}).get("http_status") in {500,502,503,504} for a in d.get("attempts") or []):
+            d["status"]="provider_unavailable"
+            d["label"]="SoldComps derzeit instabil · später erneut versuchen"
         elif d.get("raw_results",0)==0:
             d["status"]="no_provider_results"
             d["label"]="0 SoldComps-Treffer"

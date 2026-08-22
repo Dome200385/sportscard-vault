@@ -7,11 +7,57 @@ from typing import Any
 from datetime import date, timedelta
 import re
 import unicodedata
+import time
+from datetime import datetime, timezone
 
 import httpx
 
 from .config import settings
 
+
+# V0.23.0 provider resilience: display-only runtime health. This never changes
+# valuation and is intentionally process-local; persisted comps remain the source of truth.
+_SOLDCOMPS_HEALTH: dict[str, Any] = {
+    "state": "unknown", "last_success_at": None, "last_error_at": None,
+    "last_http_status": None, "last_error": None, "consecutive_failures": 0,
+}
+
+_SOLDCOMPS_ACTIVE_HEALTH: dict[str, Any] = {
+    "state": "unknown", "last_success_at": None, "last_error_at": None,
+    "last_http_status": None, "last_error": None, "consecutive_failures": 0,
+}
+
+def _health_stamp() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+def _soldcomps_success() -> None:
+    _SOLDCOMPS_HEALTH.update({
+        "state":"operational", "last_success_at":_health_stamp(), "last_http_status":200,
+        "last_error":None, "consecutive_failures":0,
+    })
+
+def _soldcomps_failure(message: str, status_code: int | None = None) -> None:
+    failures=int(_SOLDCOMPS_HEALTH.get("consecutive_failures") or 0)+1
+    transient=status_code in {500,502,503,504} or status_code is None
+    _SOLDCOMPS_HEALTH.update({
+        "state":"degraded" if transient else "error", "last_error_at":_health_stamp(),
+        "last_http_status":status_code, "last_error":message[:300], "consecutive_failures":failures,
+    })
+
+
+def _soldcomps_active_success() -> None:
+    _SOLDCOMPS_ACTIVE_HEALTH.update({
+        "state":"operational", "last_success_at":_health_stamp(), "last_http_status":200,
+        "last_error":None, "consecutive_failures":0,
+    })
+
+def _soldcomps_active_failure(message: str, status_code: int | None = None) -> None:
+    failures=int(_SOLDCOMPS_ACTIVE_HEALTH.get("consecutive_failures") or 0)+1
+    transient=status_code in {500,502,503,504} or status_code is None
+    _SOLDCOMPS_ACTIVE_HEALTH.update({
+        "state":"degraded" if transient else "error", "last_error_at":_health_stamp(),
+        "last_http_status":status_code, "last_error":message[:300], "consecutive_failures":failures,
+    })
 
 
 
@@ -438,44 +484,150 @@ def soldcomps_search(fp: MarketFingerprint, *, query_override: str | None = None
     if not fp.subject or not (fp.product_line or fp.set_name) or not query:
         raise SoldCompsError("Fingerprint is too incomplete for an automatic sold-comps search")
     params: dict[str, Any] = {
-        "keyword": query,
-        "page": 1,
-        "count": settings.soldcomps_count,
-        "ebaySite": settings.soldcomps_ebay_site,
-        "sortOrder": "endedRecently",
-        "sold": "true",
-        "exactMatch": "true" if exact_match else "false",
-        "includeCompleteListing": "true",
+        "keyword": query, "page": 1, "count": settings.soldcomps_count,
+        "ebaySite": settings.soldcomps_ebay_site, "sortOrder": "endedRecently", "sold": "true",
+        "exactMatch": "true" if exact_match else "false", "includeCompleteListing": "true",
         "soldAfter": (date.today() - timedelta(days=int(history_days or settings.soldcomps_days))).isoformat(),
     }
     headers = {"Authorization": f"Bearer {settings.soldcomps_api_key}", "Accept": "application/json"}
-    try:
-        with httpx.Client(timeout=settings.soldcomps_timeout_seconds, follow_redirects=True) as client:
-            response = client.get(settings.soldcomps_api_base.rstrip("/") + "/v1/scrape", params=params, headers=headers)
-    except httpx.HTTPError as exc:
-        raise SoldCompsError(f"SoldComps network error: {exc}") from exc
-    if response.status_code != 200:
+    url=settings.soldcomps_api_base.rstrip("/") + "/v1/scrape"
+    response=None
+    last_network_error=None
+    # SoldComps announced instability of sold-listing requests. Retry only transient
+    # failures; never retry auth/quota/client errors and never fabricate a fallback price.
+    for attempt in range(3):
         try:
-            body = response.json()
-        except Exception:
-            body = {"message": response.text[:500]}
+            with httpx.Client(timeout=settings.soldcomps_timeout_seconds, follow_redirects=True) as client:
+                response = client.get(url, params=params, headers=headers)
+            if response.status_code not in {500,502,503,504}:
+                break
+        except httpx.HTTPError as exc:
+            last_network_error=exc
+            response=None
+        if attempt < 2:
+            time.sleep(0.6 * (2 ** attempt))
+    if response is None:
+        message=f"SoldComps network error after retries: {last_network_error}"
+        _soldcomps_failure(message, None)
+        raise SoldCompsError(message, code="provider_unavailable") from last_network_error
+    if response.status_code != 200:
+        try: body = response.json()
+        except Exception: body = {"message": response.text[:500]}
         code = body.get("code") if isinstance(body, dict) else None
         message = body.get("message") or body.get("error") or str(body)
-        raise SoldCompsError(f"SoldComps HTTP {response.status_code}: {message}", status_code=response.status_code, code=code)
+        full=f"SoldComps HTTP {response.status_code}: {message}"
+        _soldcomps_failure(full, response.status_code)
+        if response.status_code in {500,502,503,504}: code=code or "provider_unavailable"
+        raise SoldCompsError(full, status_code=response.status_code, code=code)
+    _soldcomps_success()
     data = response.json()
     items = data.get("items") or []
     return {
-        "provider": "soldcomps",
-        "query": query,
-        "items": items,
-        "total_items": data.get("totalItems", len(items)),
-        "total_results": data.get("totalResults"),
-        "has_next_page": bool(data.get("hasNextPage")),
-        "scraped_count": data.get("scrapedCount"),
-        "auto_selected_category": data.get("autoSelectedCategory"),
-        "ebay_site": settings.soldcomps_ebay_site,
-        "sold_after": params["soldAfter"],
-        "exact_match": exact_match,
+        "provider":"soldcomps", "query":query, "items":items,
+        "total_items":data.get("totalItems",len(items)), "total_results":data.get("totalResults"),
+        "has_next_page":bool(data.get("hasNextPage")), "scraped_count":data.get("scrapedCount"),
+        "auto_selected_category":data.get("autoSelectedCategory"), "ebay_site":settings.soldcomps_ebay_site,
+        "sold_after":params["soldAfter"], "exact_match":exact_match,
+    }
+
+
+
+def active_listings_search(fp: MarketFingerprint, *, query_override: str | None = None, exact_match: bool = False) -> dict[str, Any]:
+    """Fetch active eBay listings through SoldComps.
+
+    Active asking prices are *never* treated as sold comps or portfolio market
+    value. They are a secondary market-pressure indicator only.
+    """
+    if not settings.soldcomps_api_key:
+        raise SoldCompsError("SOLDCOMPS_API_KEY is not configured")
+    query=(query_override or fp.soldcomps_fallback_query() or fp.soldcomps_query()).strip()
+    if not fp.subject or not query:
+        raise SoldCompsError("Fingerprint is too incomplete for an active-listings search")
+    params: dict[str, Any] = {
+        "keyword": query, "page": 1, "count": min(settings.soldcomps_count, 120),
+        "ebaySite": settings.soldcomps_ebay_site, "sortOrder": "timeNewlyListed", "sold": "false",
+        "exactMatch": "true" if exact_match else "false", "includeCompleteListing": "true",
+    }
+    headers={"Authorization":f"Bearer {settings.soldcomps_api_key}","Accept":"application/json"}
+    url=settings.soldcomps_api_base.rstrip("/")+"/v1/scrape"
+    response=None; last_network_error=None
+    for attempt in range(3):
+        try:
+            with httpx.Client(timeout=settings.soldcomps_timeout_seconds, follow_redirects=True) as client:
+                response=client.get(url,params=params,headers=headers)
+            if response.status_code not in {500,502,503,504}:
+                break
+        except httpx.HTTPError as exc:
+            last_network_error=exc; response=None
+        if attempt<2:
+            time.sleep(0.6*(2**attempt))
+    if response is None:
+        message=f"SoldComps active-listings network error after retries: {last_network_error}"
+        _soldcomps_active_failure(message,None)
+        raise SoldCompsError(message,code="provider_unavailable") from last_network_error
+    if response.status_code != 200:
+        try: body=response.json()
+        except Exception: body={"message":response.text[:500]}
+        code=body.get("code") if isinstance(body,dict) else None
+        message=body.get("message") or body.get("error") or str(body)
+        full=f"SoldComps active HTTP {response.status_code}: {message}"
+        _soldcomps_active_failure(full,response.status_code)
+        if response.status_code in {500,502,503,504}: code=code or "provider_unavailable"
+        raise SoldCompsError(full,status_code=response.status_code,code=code)
+    _soldcomps_active_success()
+    data=response.json(); items=data.get("items") or []
+    return {
+        "provider":"soldcomps_active","query":query,"items":items,
+        "total_items":data.get("totalItems",len(items)),"total_results":data.get("totalResults"),
+        "has_next_page":bool(data.get("hasNextPage")),"scraped_count":data.get("scrapedCount"),
+        "auto_selected_category":data.get("autoSelectedCategory"),"ebay_site":settings.soldcomps_ebay_site,
+        "exact_match":exact_match,
+    }
+
+
+def normalize_active_listings(fp: MarketFingerprint, search: dict[str, Any]) -> dict[str, Any]:
+    """Strictly identity-match active listings and summarize asking prices.
+
+    This intentionally reuses the sold-listing identity matcher, but reads
+    currentPrice/currentCurrency. The resulting median is display-only.
+    """
+    matches=[]; rejected=[]
+    for item in search.get("items") or []:
+        match=score_sold_listing(fp,item)
+        current=_float(item.get("currentPrice"))
+        shipping=_float(item.get("shippingPrice")) or 0.0
+        total=_float(item.get("totalPrice"))
+        if total is None and current is not None:
+            total=current+shipping
+        currency=(item.get("currentCurrency") or item.get("shippingCurrency") or "USD").upper()
+        row={"item":item,"match":match,"asking_total":total,"currency":currency}
+        if match["acceptable_for_comp"] and total is not None and total>0:
+            matches.append(row)
+        else:
+            rejected.append(row)
+    groups={}
+    for row in matches: groups.setdefault(row["currency"],[]).append(row)
+    if groups:
+        currency,selected=max(groups.items(),key=lambda kv:len(kv[1]))
+    else:
+        currency,selected=None,[]
+    values=[float(r["asking_total"]) for r in selected]
+    flags=_robust_outlier_flags(values)
+    kept=[r for r,flag in zip(selected,flags) if flag]
+    kept_values=[float(r["asking_total"]) for r in kept]
+    return {
+        "query":search.get("query"),"raw_count":len(search.get("items") or []),
+        "identity_matches":len(matches),"included_count":len(kept),"currency":currency,
+        "median_ask":round(float(median(kept_values)),2) if kept_values else None,
+        "low_ask":round(min(kept_values),2) if kept_values else None,
+        "high_ask":round(max(kept_values),2) if kept_values else None,
+        "items":[{
+            "item_id":r["item"].get("itemId"),"title":r["item"].get("title"),
+            "url":r["item"].get("url"),"asking_total":r["asking_total"],"currency":r["currency"],
+            "watcher_count":r["item"].get("watcherCount"),"units_sold":r["item"].get("unitsSold"),
+            "accepts_offers":r["item"].get("acceptsOffers"),"match_score":r["match"].get("score"),
+        } for r in kept[:12]],
+        "rejected_count":len(rejected)+(len(selected)-len(kept)),
     }
 
 
@@ -562,10 +714,13 @@ def provider_status() -> list[dict[str, Any]]:
             "configured": bool(settings.soldcomps_api_key),
             "supports_individual_sales": True,
             "supports_aggregate_estimate": False,
+            "supports_active_listings": True,
             "mode": "live" if settings.soldcomps_api_key else "not-configured",
             "ebay_site": settings.soldcomps_ebay_site,
             "history_days": settings.soldcomps_days,
-            "note": "Completed eBay sales only; asking prices are never used as market value.",
+            "health": dict(_SOLDCOMPS_HEALTH),
+            "active_health": dict(_SOLDCOMPS_ACTIVE_HEALTH),
+            "note": "Sold listings drive verified market value. Active asking prices are display-only and never enter valuation.",
         },
         {
             "id": "sportscardspro",
