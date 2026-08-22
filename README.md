@@ -1,13 +1,10 @@
-# Backend V0.1
+# Mobile V0.1
+Flutter source for the first Android shell.
 
-## Local start
+Because Flutter is not installed in the build environment used to create this pack, this source was structurally prepared but not compiled here. On a machine with Flutter:
 ```bash
-python -m venv .venv
-# Windows: .venv\\Scripts\\activate
-# macOS/Linux: source .venv/bin/activate
-pip install -r requirements.txt
-uvicorn app.main:app --reload
+flutter create . --platforms=android
+flutter pub get
+flutter run
 ```
-Open `http://127.0.0.1:8000/docs`.
-
-V0.1 is intentionally safe: image upload works, but the recognition adapter does **not** guess unseen card details yet. Locked Fast-Scan context is trusted; unknown critical fields are returned for confirmation. This prevents the LUDEX-style failure mode while the real recognition adapter is implemented.
+The default API URL is `http://10.0.2.2:8000` for an Android emulator. For a physical phone, replace it with the LAN or deployed Render URL.
